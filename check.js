@@ -1,6 +1,6 @@
 // `npm run check` — tests the setup without Discord:
 // Node version, audio libraries, settings, and a real round trip through
-// Claude → text-to-speech → speech-to-text. Also saves the bot's voice to a file.
+// the AI → text-to-speech → speech-to-text. Also saves the bot's voice to a file.
 import { writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { generateDependencyReport } from '@discordjs/voice';
@@ -22,24 +22,24 @@ if (problems.length) {
   for (const problem of problems) bad(problem);
   process.exit(1);
 }
-ok(`الإعدادات كاملة (STT: ${config.stt.provider} / TTS: ${config.tts.provider} / ${config.anthropic.model})`);
+ok(`الإعدادات كاملة (STT: ${config.stt.provider} / TTS: ${config.tts.provider} / AI: ${config.llm.model})`);
 
 console.log('\n--- تجربة المفاتيح ---');
-const { askClaude } = await import('./llm.js');
+const { askAI } = await import('./llm.js');
 const { synthesize, transcribe } = await import('./speech.js');
 
 let failed = false;
 try {
-  const reply = await askClaude({
+  const reply = await askAI({
     guildId: 'self-test',
     speaker: 'اختبار',
     text: 'سلم علي بجملة وحدة قصيرة.',
     vars: { SERVER_NAME: 'تجربة', CHANNEL_NAME: 'تجربة' },
   });
-  ok(`Claude رد: ${reply}`);
+  ok(`الذكاء الاصطناعي رد: ${reply}`);
 } catch (err) {
   failed = true;
-  bad(`Claude: ${err.message}`);
+  bad(`الذكاء الاصطناعي: ${err.message}`);
 }
 
 let audio;

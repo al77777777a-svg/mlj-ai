@@ -13,7 +13,7 @@ import {
 import { generateDependencyReport } from '@discordjs/voice';
 import { config, log, validateConfig } from './config.js';
 import { VoiceSession, getMode, setMode } from './voice-session.js';
-import { askClaude, resetMemory } from './llm.js';
+import { askAI, resetMemory } from './llm.js';
 
 const problems = validateConfig();
 if (problems.length) {
@@ -225,7 +225,7 @@ const handlers = {
     const question = interaction.options.getString('question', true);
     const session = sessions.get(interaction.guildId);
     await interaction.deferReply();
-    const reply = await askClaude({
+    const reply = await askAI({
       guildId: interaction.guildId,
       speaker: interaction.member.displayName,
       text: question,

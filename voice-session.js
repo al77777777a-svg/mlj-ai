@@ -1,5 +1,5 @@
 // One VoiceSession = the bot sitting in one voice channel:
-// it listens to each person, turns speech into text, asks Claude, and speaks the reply.
+// it listens to each person, turns speech into text, asks the AI, and speaks the reply.
 import { Readable } from 'node:stream';
 import {
   AudioPlayerStatus,
@@ -14,7 +14,7 @@ import {
 import { escapeMarkdown } from 'discord.js';
 import OpusScript from 'opusscript';
 import { config, log } from './config.js';
-import { askClaude } from './llm.js';
+import { askAI } from './llm.js';
 import { synthesize, transcribe, ttsChunkLimit } from './speech.js';
 import {
   DISCORD_CHANNELS,
@@ -222,14 +222,14 @@ export class VoiceSession {
   async answer(member, text, gen) {
     let reply;
     try {
-      reply = await askClaude({
+      reply = await askAI({
         guildId: this.guild.id,
         speaker: member.displayName,
         text,
         vars: { SERVER_NAME: this.guild.name, CHANNEL_NAME: this.channel.name },
       });
     } catch (err) {
-      this.reportError('llm', 'Claude', err);
+      this.reportError('llm', 'الذكاء الاصطناعي', err);
       return;
     }
     if (!reply || gen !== this.generation || this.destroyed) return;
@@ -336,6 +336,10 @@ export class VoiceSession {
     log.error(`${label}:`, message);
     if (Date.now() - (this.lastErrorAt.get(kind) ?? 0) < 60_000) return;
     this.lastErrorAt.set(kind, Date.now());
+    if (err?.status === 429) {
+      this.say(`⏳ وصلنا حد Groq المجاني في ${label} — جربوا بعد شوي، ولو خلص حد اليوم يرجع بكرة.`);
+      return;
+    }
     this.say(`⚠️ صار خطأ في ${label}: \`${message.slice(0, 200)}\``);
   }
 
