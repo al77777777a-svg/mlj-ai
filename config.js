@@ -28,7 +28,7 @@ const list = (name, fallback) =>
     .map((s) => s.trim())
     .filter(Boolean);
 
-const DEFAULT_PROMPT = `أنت {{BOT_NAME}}، مساعد ذكاء اصطناعي صوتي في روم صوتي في سيرفر ديسكورد "{{SERVER_NAME}}".
+const DEFAULT_PROMPT = `أنت {{BOT_NAME}}، مساعد ذكاء اصطناعي صوتي في روم صوتي في سيرفر ديسكورد "{{SERVER_NAME}}". إذا أحد سألك منو أنت، قل إنك {{BOT_NAME}}.
 ردودك تتحول لصوت، فخلها قصيرة وطبيعية (جملة إلى ثلاث جمل) وبدون إيموجي أو ماركداون أو روابط.
 إذا كلموك بالعربي رد بلهجة خليجية إماراتية واضحة، وإذا كلموك بالإنجليزي رد بالإنجليزي.
 الكلام يوصلك بصيغة "الاسم: الكلام" من تحويل صوت لنص، فممكن يكون فيه أخطاء؛ افهم المقصود.
@@ -45,14 +45,14 @@ function loadPrompt() {
 
 const sttProvider = env('STT_PROVIDER', 'groq').toLowerCase();
 const ttsProvider = env('TTS_PROVIDER', 'groq').toLowerCase();
-const botName = env('BOT_NAME', 'كلود');
+const botName = env('BOT_NAME', 'بوت');
 
 export const config = {
   discordToken: env('DISCORD_TOKEN'),
 
   botName,
   // The bot's own name always counts as a wake word.
-  wakeWords: [...new Set([botName, ...list('WAKE_WORDS', 'كلود,كلاود,claude,بوت')])],
+  wakeWords: [...new Set([botName, ...list('WAKE_WORDS', 'بوت,bot')])],
   stopWords: list('STOP_WORDS', 'اسكت,خلاص,بس,وقف,كفايه,stop'),
   replyMode: env('REPLY_MODE', 'name').toLowerCase(), // name | everyone
   followUpSeconds: num('FOLLOWUP_SECONDS', 15),
@@ -68,14 +68,13 @@ export const config = {
   maxSpeechSeconds: num('MAX_SPEECH_SECONDS', 30),
   minVolume: num('MIN_VOLUME', 100), // RMS level below which audio counts as silence
 
-  anthropic: {
-    apiKey: env('ANTHROPIC_API_KEY'),
-    model: env('ANTHROPIC_MODEL', 'claude-haiku-5-5'),
-    effort: env('ANTHROPIC_EFFORT', 'low'),
-    maxTokens: num('MAX_REPLY_TOKENS', 400),
-    webSearch: bool('WEB_SEARCH', false),
-    searchCountry: env('SEARCH_COUNTRY', 'AE'),
-    memoryTurns: num('MEMORY_TURNS', 12),
+  // The brain: a Groq chat model (same Groq key as listening and speaking).
+  llm: {
+    apiKey: env('GROQ_API_KEY'),
+    model: env('GROQ_CHAT_MODEL', 'openai/gpt-oss-120b'),
+    maxTokens: num('MAX_REPLY_TOKENS', 1024),
+    // Short memory keeps each request small (Groq's free plan limits tokens per minute).
+    memoryTurns: num('MEMORY_TURNS', 6),
     memoryMinutes: num('MEMORY_MINUTES', 30),
   },
 
@@ -128,7 +127,7 @@ export function validateConfig() {
   };
 
   need(config.discordToken, 'DISCORD_TOKEN فاضي — حط توكن البوت من Discord Developer Portal.');
-  need(config.anthropic.apiKey, 'ANTHROPIC_API_KEY فاضي — سو مفتاح من https://platform.claude.com');
+  need(config.llm.apiKey, 'GROQ_API_KEY فاضي — سو مفتاح مجاني من https://console.groq.com/keys');
 
   if (!['name', 'everyone'].includes(config.replyMode)) {
     problems.push('REPLY_MODE لازم يكون name أو everyone.');

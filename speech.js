@@ -1,8 +1,34 @@
 // Speech services:
 // - transcribe(): speech → text (Groq Whisper by default, or OpenAI)
 // - synthesize(): text → speech (Groq, Azure or ElevenLabs), returns WAV/MP3 bytes
+// - apiRequest() / apiError(): shared HTTP helpers (also used by llm.js)
 import { config } from './config.js';
 import { mostlyLatin } from './helpers.js';
+
+// ---------- HTTP helpers ----------
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * fetch with a 30 s timeout. When the service says "too many requests" (429)
+ * and asks to wait only a few seconds, wait and try once more.
+ */
+export async function apiRequest(url, init) {
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(url, { ...init, signal: AbortSignal.timeout(30_000) });
+    const header = res.headers.get('retry-after');
+    const wait = header === null ? NaN : Number(header);
+    if (res.status !== 429 || attempt > 0 || !(wait >= 0 && wait <= 8)) return res;
+    await sleep(wait * 1000 + 300);
+  }
+}
+
+/** Turn a failed response into an Error that carries the HTTP status. */
+export async function apiError(res, label) {
+  const detail = (await res.text().catch(() => '')).slice(0, 300);
+  const error = new Error(`${label} ${res.status}: ${detail}`);
+  error.status = res.status;
+  return error;
+}
 
 // ---------- Speech to text ----------
 function buildForm(audio, file, withHints) {
@@ -26,12 +52,11 @@ function buildForm(audio, file, withHints) {
   return form;
 }
 
-async function post(form) {
-  return fetch(config.stt.url, {
+function post(form) {
+  return apiRequest(config.stt.url, {
     method: 'POST',
     headers: { Authorization: `Bearer ${config.stt.apiKey}` },
     body: form,
-    signal: AbortSignal.timeout(30_000),
   });
 }
 
@@ -43,10 +68,7 @@ export async function transcribe(audio, file = { name: 'speech.wav', type: 'audi
   let res = await post(buildForm(audio, file, true));
   // If the service rejects an optional hint, try once more without hints.
   if (res.status === 400) res = await post(buildForm(audio, file, false));
-  if (!res.ok) {
-    const detail = (await res.text().catch(() => '')).slice(0, 300);
-    throw new Error(`STT ${res.status}: ${detail}`);
-  }
+  if (!res.ok) throw await apiError(res, 'STT');
   const data = await res.json();
   return String(data?.text ?? '').trim();
 }
@@ -115,11 +137,8 @@ function elevenLabsSpeech(text) {
 }
 
 async function fetchAudio(url, { headers, body }) {
-  const res = await fetch(url, { method: 'POST', headers, body, signal: AbortSignal.timeout(30_000) });
-  if (!res.ok) {
-    const detail = (await res.text().catch(() => '')).slice(0, 300);
-    throw new Error(`TTS ${res.status}: ${detail}`);
-  }
+  const res = await apiRequest(url, { method: 'POST', headers, body });
+  if (!res.ok) throw await apiError(res, 'TTS');
   return Buffer.from(await res.arrayBuffer());
 }
 

@@ -1,25 +1,23 @@
-// The bot's brain: Claude via the Anthropic API, with short per-server memory.
-import Anthropic from '@anthropic-ai/sdk';
+// The bot's brain: a Groq chat model (works on Groq's free plan), with short per-server memory.
 import { config, log } from './config.js';
 import { fillTemplate } from './helpers.js';
+import { apiError, apiRequest } from './speech.js';
 
-const client = new Anthropic({ apiKey: config.anthropic.apiKey, timeout: 60_000, maxRetries: 2 });
+const CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
 // guildId -> { messages: [{ role, content }], lastUsed }
 const memories = new Map();
 
-// Voice needs speed: try thinking off + low effort. If a model rejects
-// one of these options, stop sending it (the reply still works without it).
-let sendThinkingOff = true;
-let sendEffort = Boolean(config.anthropic.effort);
-let sendWebSearch = config.anthropic.webSearch;
+// Voice needs speed: ask reasoning models to think briefly and return only the answer.
+// If a model rejects these options, stop sending them.
+let sendReasoningOptions = true;
 
 export function resetMemory(guildId) {
   memories.delete(guildId);
 }
 
 function memoryFor(guildId) {
-  const maxAge = config.anthropic.memoryMinutes * 60_000;
+  const maxAge = config.llm.memoryMinutes * 60_000;
   const memory = memories.get(guildId);
   if (memory && Date.now() - memory.lastUsed < maxAge) return memory;
   const fresh = { messages: [], lastUsed: Date.now() };
@@ -36,11 +34,17 @@ function now() {
   }
 }
 
+function reasoningOptions(model) {
+  if (model.startsWith('openai/gpt-oss')) return { reasoning_effort: 'low', include_reasoning: false };
+  if (model.startsWith('qwen/')) return { reasoning_effort: 'none' };
+  return {};
+}
+
 /**
- * Ask Claude. `speaker` is the Discord display name, `text` what they said.
- * Returns the reply text ('' if Claude had nothing to say).
+ * Ask the AI. `speaker` is the Discord display name, `text` what they said.
+ * Returns the reply text ('' if the AI had nothing to say).
  */
-export async function askClaude({ guildId, speaker, text, vars = {} }) {
+export async function askAI({ guildId, speaker, text, vars = {} }) {
   const memory = memoryFor(guildId);
   const question = { role: 'user', content: `${speaker}: ${text}` };
   const system = fillTemplate(config.systemPrompt, {
@@ -50,91 +54,48 @@ export async function askClaude({ guildId, speaker, text, vars = {} }) {
     ...vars,
   });
 
-  const reply = await createReply(system, [...memory.messages, question]);
+  const reply = await createReply([{ role: 'system', content: system }, ...memory.messages, question]);
   if (reply) {
     memory.messages.push(question, { role: 'assistant', content: reply });
-    const max = Math.max(2, config.anthropic.memoryTurns * 2);
+    const max = Math.max(2, config.llm.memoryTurns * 2);
     if (memory.messages.length > max) memory.messages.splice(0, memory.messages.length - max);
   }
   memory.lastUsed = Date.now();
   return reply;
 }
 
-async function createReply(system, messages) {
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const params = {
-      model: config.anthropic.model,
-      max_tokens: config.anthropic.maxTokens,
-      system,
+async function createReply(messages) {
+  const { apiKey, model, maxTokens } = config.llm;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const body = {
+      model,
       messages,
+      max_completion_tokens: maxTokens,
+      ...(sendReasoningOptions ? reasoningOptions(model) : {}),
     };
-    if (sendThinkingOff) params.thinking = { type: 'disabled' };
-    // Thinking tokens count toward max_tokens, so leave room when it stays on.
-    else params.max_tokens = Math.max(params.max_tokens, 2000);
-    if (sendEffort) params.output_config = { effort: config.anthropic.effort };
-    if (sendWebSearch) {
-      params.tools = [
-        {
-          type: 'web_search_20250305',
-          name: 'web_search',
-          max_uses: 2,
-          user_location: {
-            type: 'approximate',
-            country: config.anthropic.searchCountry,
-            timezone: config.timezone,
-          },
-        },
-      ];
+    const res = await apiRequest(CHAT_URL, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      return cleanReply(data?.choices?.[0]?.message?.content);
     }
-
-    try {
-      return await runTurn(params);
-    } catch (err) {
-      const message = String(err?.message ?? '');
-      if (err?.status === 400 && params.thinking && /thinking/i.test(message)) {
-        log.warn(`الموديل ${params.model} ما يقبل إيقاف التفكير — بكمل بدونه.`);
-        sendThinkingOff = false;
-        continue;
-      }
-      if (err?.status === 400 && params.output_config && /effort|output_config/i.test(message)) {
-        log.warn(`الموديل ${params.model} ما يقبل إعداد effort — بكمل بدونه.`);
-        sendEffort = false;
-        continue;
-      }
-      if (err?.status === 400 && params.tools && /web.?search/i.test(message)) {
-        log.warn('البحث في النت مو مفعّل لحسابك في Claude Console — بكمل بدونه.');
-        sendWebSearch = false;
-        continue;
-      }
-      throw err;
+    const error = await apiError(res, 'AI');
+    if (res.status === 400 && sendReasoningOptions && /reason/i.test(error.message)) {
+      log.warn(`الموديل ${model} ما يقبل إعدادات التفكير — بكمل بدونها.`);
+      sendReasoningOptions = false;
+      continue;
     }
+    throw error;
   }
-  throw new Error('Claude request failed');
+  throw new Error('AI request failed');
 }
 
-async function runTurn(params) {
-  let messages = params.messages;
-  let response;
-  // Web search can pause a long turn; send it back to let Claude continue.
-  for (let i = 0; i < 3; i++) {
-    response = await client.messages.create({ ...params, messages });
-    if (response.stop_reason !== 'pause_turn') break;
-    messages = [...messages, { role: 'assistant', content: response.content }];
-  }
-  return spokenText(response.content);
-}
-
-/** The text Claude wrote after its last web search (or all text if it didn't search). */
-function spokenText(content = []) {
-  let start = 0;
-  content.forEach((block, i) => {
-    if (String(block.type).endsWith('tool_result')) start = i + 1;
-  });
-  const join = (blocks) =>
-    blocks
-      .filter((b) => b.type === 'text')
-      .map((b) => b.text)
-      .join('')
-      .trim();
-  return join(content.slice(start)) || join(content);
+/** Drop any "thinking" the model may have written into its answer. */
+function cleanReply(text) {
+  return String(text ?? '')
+    .replace(/<think>[\s\S]*?<\/think>/g, '')
+    .trim();
 }
