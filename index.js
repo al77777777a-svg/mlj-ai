@@ -14,7 +14,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { generateDependencyReport } from '@discordjs/voice';
 import { ROOT, config, log, validateConfig } from './config.js';
-import { VoiceSession, getMode, setMode } from './voice-session.js';
+import { VOICE_PERMISSIONS, VoiceSession, getMode, setMode } from './voice-session.js';
 import { askAI, forgetAll, resetMemory } from './llm.js';
 
 const problems = validateConfig();
@@ -30,7 +30,6 @@ log.debug(`\n${generateDependencyReport()}`);
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
 const sessions = new Map(); // guildId -> VoiceSession
 const aloneTimers = new Map(); // guildId -> timeout
-const VOICE_PERMISSIONS = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.Speak];
 const ephemeral = (content) => ({ content, flags: MessageFlags.Ephemeral });
 
 // ---------- Slash commands shown in Discord ----------
@@ -137,13 +136,24 @@ async function joinChannel(channel) {
     current.destroy();
     await new Promise((resolve) => setTimeout(resolve, 750));
   }
-  const session = new VoiceSession(channel, { onEnd: onSessionEnd });
+  const session = new VoiceSession(channel, { onEnd: onSessionEnd, moveTo: moveSession });
   sessions.set(guildId, session);
   await session.connect(); // throws if the voice connection fails
   session.announce();
   log.info(`🎙️  دشيت "${channel.name}" في "${channel.guild.name}"`);
   checkAlone(session);
+  session.welcome(session.humans()); // hello to whoever is already in the room
   return session;
+}
+
+/** "فطوم روحي روم القهوة": go to that room; if it doesn't work, go back to the one she was in. */
+async function moveSession(channel, back) {
+  try {
+    return await joinChannel(channel);
+  } catch (err) {
+    logJoinError(err);
+    return back ? joinChannel(back).catch(logJoinError) : null;
+  }
 }
 
 function onSessionEnd(session) {
@@ -210,6 +220,19 @@ client.on(Events.VoiceStateUpdate, (oldState, newState) => {
     session.channel = newState.channel; // someone moved the bot
   }
   if (session) checkAlone(session);
+
+  // Someone came into her room: say hello by name.
+  const member = newState.member;
+  if (
+    session &&
+    !session.destroyed &&
+    member &&
+    !member.user?.bot &&
+    newState.channelId === session.channel.id &&
+    oldState.channelId !== newState.channelId
+  ) {
+    session.welcome([{ id: member.id, name: member.displayName }]);
+  }
 
   const joinedAutoRoom =
     config.autoJoinChannelId &&

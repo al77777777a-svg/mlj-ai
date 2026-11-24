@@ -72,6 +72,99 @@ export function isStopCommand(text, stopWords, wakeWords) {
   return rest.length > 0 && rest.length <= 4 && rest.every((t) => stop.has(t));
 }
 
+// ---------- Names, rooms and "does this need fresh info?" ----------
+
+/** A name as it should be read aloud: decorations and emoji removed ("『MLG』 Ali ✨" → "MLG Ali"). */
+export function speakableName(name) {
+  return String(name ?? '')
+    .normalize('NFKC')
+    .replace(/[^\p{L}\p{N}\s'-]/gu, ' ')
+    .replace(/[_\s]+/g, ' ')
+    .trim()
+    .slice(0, 24);
+}
+
+/** ["منصور"] → "منصور"; two or three → "منصور وأحمد وسالم"; more → the first two and "والربع". */
+export function joinNames(names) {
+  const list = names.filter(Boolean);
+  if (list.length > 3) return `${list[0]} و${list[1]} والربع`;
+  return list.reduce((out, name, i) => (i === 0 ? name : `${out} و${name}`), '');
+}
+
+const MOVE_VERBS = new Set(['روح', 'روحي', 'رح', 'رحي', 'انتقل', 'انتقلي', 'ادخل', 'ادخلي', 'تعال', 'تعالي', 'اذهب', 'اذهبي']);
+const ROOM_WORDS = new Set(['روم', 'رووم', 'غرفه', 'قناه', 'الروم', 'الغرفه', 'القناه', 'room', 'channel', 'voice']);
+const FILLER_WORDS = new Set(['صوتي', 'الصوتي', 'صوتيه', 'الصوتيه', 'حق', 'اللي', 'الي', 'علي', 'في', 'ع', 'عند', 'ل', 'اسمه', 'اسمها', 'ذاك', 'ذيك', 'هذا', 'هذي', 'لو', 'سمحت', 'بسرعه', 'الحين', 'يالله']);
+
+/**
+ * "فطوم روحي روم الألعاب" → { query: 'العاب', explicit: true }.
+ * `explicit` = the sentence said "room"; without it the name has to match a real room to count.
+ * Returns null when the sentence is not a "go to a room" request.
+ */
+export function parseMoveCommand(text, wakeWords) {
+  const words = withoutWakeWords(text, wakeWords);
+  const at = words.findIndex((w) => MOVE_VERBS.has(w));
+  if (at < 0 || at > 2) return null;
+  let explicit = false;
+  const query = [];
+  for (let word of words.slice(at + 1)) {
+    word = word.replace(/^لل/, 'ال').replace(/^(?:علي|في|الي|ع|ل)(?=ال)/, '');
+    if (ROOM_WORDS.has(word)) explicit = true;
+    else if (!FILLER_WORDS.has(word)) query.push(word);
+  }
+  if (!query.length || query.length > 5) return null;
+  return { query: query.join(' '), explicit };
+}
+
+const stripArticle = (word) => (word.startsWith('ال') && word.length > 3 ? word.slice(2) : word);
+const roomKey = (text) => tokens(text).map(stripArticle).join(' ');
+
+function similarity(a, b) {
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  if (Math.min(a.length, b.length) >= 3 && (a.includes(b) || b.includes(a))) return 0.9;
+  const prev = Array.from({ length: b.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= a.length; i++) {
+    let diagonal = prev[0];
+    prev[0] = i;
+    for (let j = 1; j <= b.length; j++) {
+      const above = prev[j];
+      prev[j] = Math.min(prev[j] + 1, prev[j - 1] + 1, diagonal + (a[i - 1] === b[j - 1] ? 0 : 1));
+      diagonal = above;
+    }
+  }
+  return 1 - prev[b.length] / Math.max(a.length, b.length);
+}
+
+/** The room whose name best matches what was said (null if nothing is close enough or two rooms tie). */
+export function findVoiceChannel(query, channels, minScore = 0.7) {
+  const wanted = roomKey(query);
+  const scored = channels
+    .map((channel) => ({ channel, score: similarity(wanted, roomKey(channel.name)) }))
+    .sort((x, y) => y.score - x.score);
+  if (!scored.length || scored[0].score < minScore) return null;
+  if (scored[1] && scored[0].score - scored[1].score < 0.1) return null;
+  return scored[0].channel;
+}
+
+// Questions that need today's facts (news, weather, prices, scores, prayer times...). Matched on whole words.
+const FRESH_WORDS = new Set(
+  [
+    'اخبار', 'خبر', 'عاجل', 'طقس', 'الطقس', 'الجو', 'حراره', 'الحراره', 'رطوبه', 'مطر', 'امطار', 'غبار', 'سعر', 'اسعار',
+    'بكم', 'ذهب', 'الذهب', 'دولار', 'الدولار', 'بيتكوين', 'اسهم', 'سهم', 'بورصه', 'نتيجه', 'نتايج', 'مباراه', 'مباريه',
+    'دوري', 'فاز', 'اذان', 'الاذان', 'مواقيت', 'ابحث', 'ابحثي', 'قوقل', 'جوجل', 'احدث', 'ترند', 'تريند', 'رئيس', 'وزير',
+  ].map(normalize),
+);
+
+/** True when the question probably needs up-to-date facts (so Google Search is worth the extra second). */
+export function wantsFreshInfo(text, extraWords = []) {
+  const words = tokens(text);
+  const extra = new Set(extraWords.map(normalize));
+  if (words.some((w) => FRESH_WORDS.has(w) || FRESH_WORDS.has(stripArticle(w)) || extra.has(w))) return true;
+  const t = words.join(' ');
+  if (/(?:باقي|متي|موعد|وقت).*(?:مغرب|عصر|فجر|ظهر|عشاء|صلاه)/.test(t)) return true;
+  return /\b20(?:2[4-9]|3\d)\b/.test(t);
+}
+
 // Phrases Whisper-style models invent from silence or background noise.
 const HALLUCINATIONS = new Set(
   [

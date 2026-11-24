@@ -11,10 +11,10 @@ import {
   entersState,
   joinVoiceChannel,
 } from '@discordjs/voice';
-import { escapeMarkdown } from 'discord.js';
+import { ChannelType, PermissionFlagsBits, escapeMarkdown } from 'discord.js';
 import OpusScript from 'opusscript';
 import { config, log } from './config.js';
-import { askAI } from './llm.js';
+import { askAI, pickOption } from './llm.js';
 import { activeVoice, openSpeechStream, synthesize, transcribe, ttsChunkLimit } from './speech.js';
 import {
   DISCORD_CHANNELS,
@@ -22,17 +22,30 @@ import {
   cleanForSpeech,
   containsWakeWord,
   createUpsampler,
+  findVoiceChannel,
   isOnlyWakeWord,
   isStopCommand,
+  joinNames,
   liveAudioStream,
   looksLikeNoise,
+  parseMoveCommand,
   pcmDurationMs,
   pcmToWav,
   rms,
+  speakableName,
   splitForFastStart,
   stereo48kToMono16k,
   wavToDiscordPcm,
 } from './helpers.js';
+
+/** What the bot needs in a voice room: see it, join it and talk in it. */
+export const VOICE_PERMISSIONS = [PermissionFlagsBits.ViewChannel, PermissionFlagsBits.Connect, PermissionFlagsBits.Speak];
+
+const pickOne = (list) => list[Math.floor(Math.random() * list.length)];
+const MOVING = ['تمام، رايحة {room}', 'أبشر، الحين أروح {room}', 'زين، ثواني وأكون في {room}'];
+const NOT_FOUND = ['ما لقيت روم بهذا الاسم، عيدها لي', 'أي روم؟ ما عرفته، قول لي اسمه مرة ثانية'];
+const SAME_ROOM = ['أنا موجودة في نفس الروم!', 'أنا هنا في نفس الروم يالغالي'];
+const NO_ACCESS = ['ما أقدر أدخل ذاك الروم، ما عندي صلاحية'];
 
 // What the bot says when someone only calls its name (ACK_REPLIES, "ها حياتي" by default).
 const ACKS = config.ackReplies.length ? config.ackReplies : ['هلا'];
@@ -64,10 +77,15 @@ function createOpusDecoder() {
 }
 
 export class VoiceSession {
-  constructor(channel, { onEnd } = {}) {
+  constructor(channel, { onEnd, moveTo } = {}) {
     this.channel = channel;
     this.guild = channel.guild;
     this.onEnd = onEnd;
+    this.moveTo = moveTo; // async (channel, backChannel): leave this room and join another one
+    this.welcomed = new Map(); // userId -> when she last said hello to them
+    this.welcomeNames = new Map(); // userId -> name, waiting for the hello
+    this.welcomeTimer = null;
+    this.currentSpeaker = null; // the person she is answering right now
     this.connection = null;
     this.player = createAudioPlayer();
     this.player.on('error', (err) => log.error('مشغل الصوت:', err.message));
@@ -145,6 +163,8 @@ export class VoiceSession {
     const chunks = [];
     let bytes = 0;
     let done = false;
+    let interrupted = false; // this person talked over her, so she stopped
+    let nextBargeCheckMs = config.bargeInMs;
 
     const finish = () => {
       if (done) return;
@@ -153,7 +173,7 @@ export class VoiceSession {
       decoder.free();
       if (!stream.destroyed) stream.destroy();
       const pcm = Buffer.concat(chunks);
-      this.onUtterance(userId, pcm, startedWhileTalking).catch((err) =>
+      this.onUtterance(userId, pcm, startedWhileTalking && !interrupted).catch((err) =>
         log.error('معالجة الكلام:', err?.message ?? err),
       );
     };
@@ -166,6 +186,16 @@ export class VoiceSession {
         bytes += pcm.length;
       }
       if (bytes >= maxBytes) finish();
+      else if (pcm && !interrupted && pcmDurationMs(bytes) >= nextBargeCheckMs) {
+        // They keep talking while she talks: she stops and listens (a cough or a click is too short to count).
+        if (this.isTalking() && this.canBargeIn(userId) && rms(Buffer.concat(chunks)) >= config.minVolume) {
+          interrupted = true;
+          this.stop();
+          log.info('✋ قاطعوها — سكتت');
+        } else {
+          nextBargeCheckMs += 250;
+        }
+      }
     });
     stream.once('end', finish);
     stream.once('close', finish);
@@ -220,10 +250,106 @@ export class VoiceSession {
       });
       return;
     }
+    if (config.moveByVoice && called) {
+      const move = parseMoveCommand(text, config.wakeWords);
+      if (move) {
+        this.enqueue((gen) => this.handleMove(member, text, move, gen));
+        return;
+      }
+    }
     this.enqueue((gen) => this.answer(member, text, gen));
   }
 
+  /** "فطوم روحي روم القهوة": say OK, then join that room. */
+  async handleMove(member, text, move, gen) {
+    const rooms = this.voiceRooms();
+    // A clear name match is enough; for a spoken oddity (an English room name in Arabic letters) the AI picks.
+    let target = findVoiceChannel(move.query, rooms, move.explicit ? 0.7 : 0.9);
+    if (!target && move.explicit && rooms.length) {
+      try {
+        target = rooms[await pickOption(move.query, rooms.map((room) => room.name))] ?? null;
+      } catch (err) {
+        log.debug('اختيار الروم:', err?.message ?? err);
+      }
+    }
+    if (gen !== this.generation || this.destroyed) return;
+    if (!target) {
+      // "روح العب" is not about rooms: answer it like any other sentence.
+      if (!move.explicit) return this.answer(member, text, gen);
+      log.info(`🚪 ما لقيت روم اسمه "${move.query}"`);
+      return this.speak(pickOne(NOT_FOUND), gen);
+    }
+    if (target.id === this.channel.id) return this.speak(pickOne(SAME_ROOM), gen);
+    const me = this.guild.members?.me;
+    if (!this.moveTo || !target.permissionsFor?.(me)?.has(VOICE_PERMISSIONS)) {
+      log.info(`🚪 ما أقدر أدخل "${target.name}" (ما عندي صلاحية)`);
+      return this.speak(pickOne(NO_ACCESS), gen);
+    }
+    const label = speakableName(target.name) || 'الروم';
+    await this.speak(pickOne(MOVING).replace('{room}', label), gen);
+    if (gen !== this.generation || this.destroyed) return;
+    log.info(`🚪 رايحة "${target.name}" بطلب ${member.displayName}`);
+    await this.moveTo(target, this.channel);
+  }
+
+  /** Every voice room in the server that she can see (the ones she can't join are told apart later). */
+  voiceRooms() {
+    const me = this.guild.members?.me;
+    try {
+      return [...(this.guild.channels?.cache?.values?.() ?? [])]
+        .filter((c) => c.type === ChannelType.GuildVoice && (c.permissionsFor?.(me)?.has(PermissionFlagsBits.ViewChannel) ?? true))
+        .sort((a, b) => (a.rawPosition ?? 0) - (b.rawPosition ?? 0));
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * Say hello by name to people who just came in (or who are in the room when she arrives).
+   * `people` = [{ id, name }]. People who come in together get one hello.
+   */
+  welcome(people) {
+    if (!config.welcome || this.destroyed) return;
+    const cooldown = config.welcomeCooldownSeconds * 1000;
+    for (const person of people) {
+      if (!person?.id || Date.now() - (this.welcomed.get(person.id) ?? 0) < cooldown) continue;
+      this.welcomed.set(person.id, Date.now());
+      this.welcomeNames.set(person.id, person.name);
+    }
+    if (!this.welcomeNames.size || this.welcomeTimer) return;
+    this.welcomeTimer = setTimeout(() => {
+      this.welcomeTimer = null;
+      const here = new Set(this.humans().map((p) => p.id));
+      const waiting = [...this.welcomeNames].filter(([id]) => here.has(id)); // somebody may have left again
+      this.welcomeNames.clear();
+      if (!waiting.length || this.destroyed) return;
+      const names = joinNames(waiting.map(([, name]) => speakableName(name)));
+      const text = pickOne(config.welcomeReplies.length ? config.welcomeReplies : ['هلا والله {name}'])
+        .replace('{name}', names)
+        .replace(/\s{2,}/g, ' ')
+        .trim();
+      log.info(`👋 رحبت بـ ${names || 'اللي دخل'}`);
+      this.enqueue((gen) => this.speak(text, gen));
+    }, config.welcomeDelayMs);
+  }
+
+  /** Does talking over her make her stop? Yes for the person she is answering, and in small rooms. */
+  canBargeIn(userId) {
+    if (!config.bargeIn) return false;
+    const recent = Date.now() - (this.lastAnswer.get(userId) ?? 0) < config.followUpSeconds * 1000;
+    return this.smallRoom() || recent || this.currentSpeaker === userId;
+  }
+
   async answer(member, text, gen) {
+    this.currentSpeaker = member.id;
+    try {
+      await this.answerNow(member, text, gen);
+    } finally {
+      if (this.currentSpeaker === member.id) this.currentSpeaker = null;
+    }
+  }
+
+  async answerNow(member, text, gen) {
     let reply;
     try {
       reply = await askAI({
@@ -425,6 +551,7 @@ export class VoiceSession {
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
+    clearTimeout(this.welcomeTimer);
     this.generation++;
     try {
       this.player.stop(true);

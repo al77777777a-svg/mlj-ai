@@ -86,6 +86,16 @@ export const config = {
   rememberPeople: bool('REMEMBER_PEOPLE', true), // remember people / the server between conversations
   chatMessages: bool('CHAT_MESSAGES', false),
   postTranscripts: bool('POST_TRANSCRIPTS', true),
+  // Say hello by name when someone comes into the room.
+  welcome: bool('WELCOME', true),
+  welcomeReplies: list('WELCOME_REPLIES', 'هلا والله {name},يا هلا والله {name},هلا {name} مرحبا'),
+  welcomeCooldownSeconds: num('WELCOME_COOLDOWN_SECONDS', 180), // no second hello to the same person within this time
+  welcomeDelayMs: num('WELCOME_DELAY_MS', 1200), // wait a moment so people who come in together get one hello
+  // Stop talking when someone talks over her (works for the person she is answering, and in small rooms).
+  bargeIn: bool('BARGE_IN', true),
+  bargeInMs: num('BARGE_IN_MS', 500), // how long they must speak before she stops (ignores coughs and clicks)
+  // "فطوم روحي روم القهوة": move to another voice room on request.
+  moveByVoice: bool('MOVE_BY_VOICE', true),
   avatarUpdate: bool('BOT_AVATAR_UPDATE', false), // put avatar.png on the bot even if it has a picture
   timezone: env('TIMEZONE', 'Asia/Dubai'),
   debug: bool('DEBUG', false),
@@ -101,6 +111,10 @@ export const config = {
     provider: llmProvider,
     fallback: backupFor('LLM_FALLBACK', llmProvider),
     hedgeMs: num('LLM_HEDGE_MS', 1500), // if the main brain is slower than this, the backup starts too and the first answer wins (0 = off)
+    // Fresh facts (news, weather, prices...) from Google Search through Gemini: auto = only for questions that need it, always, or off.
+    webSearch: lower('WEB_SEARCH', 'auto'),
+    searchWords: list('SEARCH_WORDS', ''), // extra words that make her search
+    searchHedgeMs: num('SEARCH_HEDGE_MS', 8000), // a search takes longer, so the backup brain (no search) waits longer
     gemini: {
       apiKey: geminiKey,
       model: env('GEMINI_CHAT_MODEL', 'gemini-3.8-flash'),
