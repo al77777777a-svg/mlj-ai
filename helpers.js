@@ -29,6 +29,19 @@ function tokens(text) {
 
 // Arabic particles that can be glued to a name: "ياكلود", "والبوت", "لكلود"...
 const PREFIXES = ['', 'يا', 'ال', 'يال', 'و', 'ويا', 'وال', 'ف', 'ب', 'ل'];
+// Endings people put on a name when they talk to her: "فطومي", "فطومتي", "فطوماتي", "فطومه", "فطومو"...
+const SUFFIXES = ['', 'ي', 'ه', 'تي', 'اتي', 'و', 'ها', 'نا'];
+
+/** One word of the text is this name (with a particle before it and, for Arabic names, an ending after it). */
+function isNameToken(word, name) {
+  const arabic = /\p{Script=Arabic}/u.test(name) && name.length >= 4; // "بوت" stays exact ("بوته" is someone else's bot)
+  for (const p of PREFIXES) {
+    if (!word.startsWith(p + name)) continue;
+    const ending = word.slice(p.length + name.length);
+    if (ending === '' || (arabic && SUFFIXES.includes(ending))) return true;
+  }
+  return false;
+}
 
 /** True if the text calls the bot by one of its names. */
 export function containsWakeWord(text, wakeWords) {
@@ -38,26 +51,24 @@ export function containsWakeWord(text, wakeWords) {
     const wake = tokens(raw);
     if (!wake.length) continue;
     for (let i = 0; i + wake.length <= words.length; i++) {
-      const first = words[i];
-      if (!PREFIXES.some((p) => first === p + wake[0])) continue;
+      if (!isNameToken(words[i], wake[0])) continue;
       if (wake.slice(1).every((w, j) => words[i + 1 + j] === w)) return true;
     }
   }
   return false;
 }
 
-function wakeTokenSet(wakeWords) {
-  const set = new Set(['يا', 'هي', 'hey', 'ok', 'اوكي']);
-  for (const raw of wakeWords) {
-    for (const w of tokens(raw)) for (const p of PREFIXES) set.add(p + w);
-  }
-  return set;
+const WAKE_EXTRAS = new Set(['يا', 'هي', 'hey', 'ok', 'اوكي']);
+
+/** Is this word just a way of calling her ("يا", "فطوم", "يافطومتي")? */
+function isWakeToken(word, wakeWords) {
+  if (WAKE_EXTRAS.has(word)) return true;
+  return wakeWords.some((raw) => tokens(raw).some((w) => isNameToken(word, w)));
 }
 
 /** The words that remain after removing the bot's name and "يا". */
 export function withoutWakeWords(text, wakeWords) {
-  const wake = wakeTokenSet(wakeWords);
-  return tokens(text).filter((t) => !wake.has(t));
+  return tokens(text).filter((t) => !isWakeToken(t, wakeWords));
 }
 
 /** "يا كلود" on its own (just calling the bot, no question yet). */
@@ -78,6 +89,14 @@ export function isStopCommand(text, stopWords, wakeWords) {
   const stop = new Set(stopWords.flatMap(tokens));
   const rest = withoutWakeWords(text, wakeWords);
   return rest.length > 0 && rest.length <= 4 && rest.every((t) => stop.has(t));
+}
+
+// Said to a woman ("اسكتي", "وقفي", "بسج"): in this room that is her, even without her name.
+const TO_HER = new Set(['اسكتي', 'سكتي', 'وقفي', 'بسج', 'خلاصج']);
+
+/** A stop command that is clearly meant for her (feminine form). */
+export function isStopForHer(text) {
+  return tokens(text).some((t) => TO_HER.has(t));
 }
 
 // ---------- Written chat ----------

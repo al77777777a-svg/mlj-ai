@@ -54,6 +54,11 @@ export function isResting(key) {
   return (restingUntil.get(key) ?? 0) > Date.now();
 }
 
+/** How long (ms) this service still rests (0 = awake). */
+export function restLeft(key) {
+  return Math.max(0, (restingUntil.get(key) ?? 0) - Date.now());
+}
+
 /** The wait a service asks for ("retry in 3s", "retryDelay": "34s", "try again in 7m12.5s"), in seconds; NaN if none. */
 export function askedWait(details) {
   const match = /(?:retry(?:Delay"?\s*:\s*"|\s+in\s+)|try again in\s+)(?:(\d+)h)?(?:(\d+)m(?!s))?(?:(\d+(?:\.\d+)?)s)?/i.exec(details);
@@ -71,7 +76,11 @@ export function restTime(error) {
     if (/per ?day|daily/i.test(details) && !(seconds >= 60)) return 60 * 60_000;
     return Math.min(Math.max((seconds || 60) * 1000, 20_000), 60 * 60_000);
   }
-  if ([400, 401, 403, 404].includes(status)) return 30 * 60_000; // a settings problem won't fix itself soon
+  // A model that no longer exists (or that this key can't use) won't come back today.
+  if (status === 404 || ([400, 403].includes(status) && /does not exist|not found|decommission|no longer|deprecated|not have access/i.test(details))) {
+    return 12 * 60 * 60_000;
+  }
+  if ([400, 401, 403].includes(status)) return 30 * 60_000; // a settings problem won't fix itself soon
   return 30_000; // busy server, timeout or network hiccup
 }
 
@@ -116,38 +125,56 @@ function post(form) {
   });
 }
 
-/** Sends one transcription request to one model. */
-async function transcribeWith(model, audio, file, hasBackup) {
+/** Mistral's Voxtral takes the file, the model and the language (no hints). */
+function mistralForm(audio, file, model) {
+  const form = new FormData();
+  form.append('file', new Blob([audio], { type: file.type }), file.name);
+  form.append('model', model);
+  const language = config.stt.language.toLowerCase() === 'auto' ? '' : config.stt.language;
+  if (language) form.append('language', language);
+  return form;
+}
+
+/** Sends one transcription request to one model ("ear"). */
+async function transcribeWith(ear, audio, file, hasBackup) {
   const send = (withHints) =>
-    apiRequest(config.stt.url, {
+    apiRequest(ear.url, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${config.stt.apiKey}` },
-      body: buildForm(audio, file, withHints, model),
-    }, 30_000, { retry429: !hasBackup }); // with a backup model, switch at once instead of waiting
+      headers: { Authorization: `Bearer ${ear.apiKey}` },
+      body: ear.mistral ? mistralForm(audio, file, ear.model) : buildForm(audio, file, withHints, ear.model),
+    }, 30_000, { retry429: !hasBackup }); // with a backup, switch at once instead of waiting
   let res = await send(true);
   // If the service rejects an optional hint, try once more without hints.
-  if (res.status === 400) res = await send(false);
-  if (!res.ok) throw await apiError(res, 'STT');
+  if (res.status === 400 && !ear.mistral) res = await send(false);
+  if (!res.ok) throw await apiError(res, ear.mistral ? 'STT (Mistral)' : 'STT');
   const data = await res.json();
   return String(data?.text ?? '').trim();
 }
 
+/** The ears in order: the main Whisper model, Groq's other Whisper model, then Mistral's Voxtral (if its key is set). */
+function ears() {
+  const { stt } = config;
+  const list = [stt.model, ...(stt.fallbackModels ?? [])].map((model) => ({ model, url: stt.url, apiKey: stt.apiKey }));
+  if (stt.mistral?.apiKey) list.push({ model: stt.mistral.model, url: stt.mistral.url, apiKey: stt.mistral.apiKey, mistral: true });
+  return list;
+}
+
 /**
  * Sends audio (a WAV buffer by default) and returns the transcript ('' if nothing was understood).
- * If the model hits its limit (Groq: 20 requests a minute per model), the next model takes over.
+ * If a model hits its limit (Groq: 20 requests a minute per model), the next one takes over at once.
  */
 export async function transcribe(audio, file = { name: 'speech.wav', type: 'audio/wav' }) {
-  const models = [config.stt.model, ...(config.stt.fallbackModels ?? [])];
-  const awake = models.filter((model) => !isResting(`stt:${model}`));
-  const order = awake.length ? awake : models.slice(0, 1);
+  const all = ears();
+  const awake = all.filter((ear) => !isResting(`stt:${ear.model}`));
+  const order = awake.length ? awake : [...all].sort((a, b) => restLeft(`stt:${a.model}`) - restLeft(`stt:${b.model}`)).slice(0, 1);
   let firstError;
   for (let i = 0; i < order.length; i++) {
     try {
       return await transcribeWith(order[i], audio, file, i < order.length - 1);
     } catch (error) {
       firstError ??= error;
-      rest(`stt:${order[i]}`, error);
-      log.warn(`STT ${order[i]} ما رد${order[i + 1] ? ` — بيسمع ${order[i + 1]} بداله` : ''}: ${shortError(error)}`);
+      rest(`stt:${order[i].model}`, error);
+      log.warn(`STT ${order[i].model} ما رد${order[i + 1] ? ` — بيسمع ${order[i + 1].model} بداله` : ''}: ${shortError(error)}`);
     }
   }
   throw firstError;
@@ -270,13 +297,46 @@ const OLD_TTS_MODELS = /^gemini-(?:2\.|3\.1-)/; // these use the 2025 request fo
 let oldRequestFormat = false;
 let designedVoice; // Promise<string | null>
 
-async function geminiSpeech(text, english) {
+/** Gemini's voice models in order (each has its own free limit); the used-up ones are skipped for a while. */
+function geminiTtsModels() {
   const g = config.tts.gemini;
+  return [g.model, ...(g.fallbackModels ?? [])].filter((model) => !isResting(`tts:gemini:${model}`));
+}
+
+/** A Gemini voice model can't speak now (limit, busy, gone): rest it. Returns true if another one can still speak. */
+function restTtsModel(model, error) {
+  rest(`tts:gemini:${model}`, error);
+  const next = geminiTtsModels()[0];
+  if (next) log.warn(`موديل الصوت ${model} ما اشتغل — بيتكلم ${next} بداله: ${shortError(error)}`);
+  return !!next;
+}
+
+const SWITCH_MODEL = new Set([404, 429, 500, 503]);
+
+async function geminiSpeech(text, english) {
+  let failure;
+  for (const model of geminiTtsModels()) {
+    try {
+      return await geminiSpeechWith(model, text, english);
+    } catch (error) {
+      failure = error;
+      if (!SWITCH_MODEL.has(error?.status) || !restTtsModel(model, error)) throw error;
+    }
+  }
+  if (failure) throw failure;
+  const error = new Error('TTS (Gemini): كل موديلات الصوت خلص حدها — لين يتجدد');
+  error.status = 429;
+  throw error;
+}
+
+async function geminiSpeechWith(model, text, english) {
+  const g = config.tts.gemini;
+  let readyOnly = false; // this backup model doesn't take the designed voice: use the ready one for it
   for (let attempt = 0; attempt < 3; attempt++) {
-    const voice = await geminiVoice();
+    const voice = readyOnly ? { id: READY_VOICE, designed: false } : await geminiVoice();
     const style = g.style || (voice.designed || english ? '' : ACCENT_STYLE);
-    const old = oldRequestFormat || OLD_TTS_MODELS.test(g.model);
-    const res = await apiRequest(`${GEMINI_API}/models/${encodeURIComponent(g.model)}:generateContent`, {
+    const old = oldRequestFormat || OLD_TTS_MODELS.test(model);
+    const res = await apiRequest(`${GEMINI_API}/models/${encodeURIComponent(model)}:generateContent`, {
       method: 'POST',
       headers: { 'x-goog-api-key': g.apiKey, 'Content-Type': 'application/json' },
       body: JSON.stringify(old ? oldSpeechBody(text, voice, style) : speechBody(text, voice, style)),
@@ -285,6 +345,10 @@ async function geminiSpeech(text, english) {
 
     const error = await apiError(res, 'TTS (Gemini)');
     if (res.status === 400 && voice.designed && /voice/i.test(error.body)) {
+      if (model !== g.model) {
+        readyOnly = true;
+        continue;
+      }
       log.warn(`الصوت الإماراتي المصمم ما اشتغل — بستخدم صوت ${READY_VOICE}: ${shortError(error)}`);
       designedVoice = Promise.resolve(null);
       continue;
@@ -329,14 +393,16 @@ export async function openSpeechStream(text, { onNotice } = {}) {
   const g = config.tts.gemini;
   if (!config.tts.stream || config.tts.provider !== 'gemini' || !g.apiKey) return null;
   if (Date.now() < streamOffUntil || isResting('tts:gemini')) return null;
+  const model = geminiTtsModels()[0];
+  if (!model) return null;
   if (text.length <= CACHE_TEXT_MAX && clips.has(`gemini:${text}`)) return null; // already saved: instant
   const abort = new AbortController();
   try {
     const voice = await geminiVoice();
     const style = g.style || (voice.designed || mostlyLatin(text) ? '' : ACCENT_STYLE);
-    const old = oldRequestFormat || OLD_TTS_MODELS.test(g.model);
+    const old = oldRequestFormat || OLD_TTS_MODELS.test(model);
     const res = await apiRequest(
-      `${GEMINI_API}/models/${encodeURIComponent(g.model)}:streamGenerateContent?alt=sse`,
+      `${GEMINI_API}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`,
       {
         method: 'POST',
         headers: { 'x-goog-api-key': g.apiKey, 'Content-Type': 'application/json' },
@@ -411,9 +477,12 @@ export async function openSpeechStream(text, { onNotice } = {}) {
     abort.abort();
     // A limited Gemini: rest it, tell the room, and let the backup voice speak (normal path).
     // Anything else means streaming doesn't work here, so don't try it again for a while.
-    if (error?.status === 429) {
-      const next = config.tts.fallbacks.find((who) => !isResting(`tts:${who}`)) ?? config.tts.fallbacks[0];
-      if (next && rest('tts:gemini', error)) onNotice?.(voiceNotice('gemini', next, error));
+    if ([429, 500, 503].includes(error?.status)) {
+      // This voice model is used up (or busy): the next Gemini voice model speaks; when none is left, the backup voice.
+      if (!restTtsModel(model, error)) {
+        const next = config.tts.fallbacks.find((who) => !isResting(`tts:${who}`)) ?? config.tts.fallbacks[0];
+        if (next && rest('tts:gemini', error)) onNotice?.(voiceNotice('gemini', next, error));
+      }
     } else {
       streamOffUntil = Date.now() + 10 * 60_000;
       log.warn(`بث الصوت من Gemini ما اشتغل — بستخدم الطريقة العادية: ${shortError(error)}`);

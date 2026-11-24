@@ -27,9 +27,11 @@ const { llm, tts } = config;
 const backup = (fallback) => (fallback ? ` (الاحتياط: ${fallback})` : '');
 const brainModel = (name) => (llm[name] ?? llm.extras[name]).model;
 ok(`الإعدادات كاملة — الاسم: ${config.botName}`);
-note(`السمع: ${config.stt.provider}`);
-note(`العقل: ${llm.provider} / ${brainModel(llm.provider)}${backup(llm.fallbacks.join(' ← '))}`);
-note(`الصوت: ${tts.provider}${tts.provider === 'gemini' ? ` / ${tts.gemini.model} / ${tts.gemini.voice}` : ''}${backup(tts.fallback)}`);
+const brains = (chain) => chain.map((name) => `${name} (${brainModel(name)})`).join(' ← ');
+note(`السمع: ${[config.stt.model, ...(config.stt.fallbackModels ?? []), config.stt.mistral?.apiKey && config.stt.mistral.model].filter(Boolean).join(' ← ')}`);
+note(`العقل للصوت: ${brains(llm.chain)}`);
+note(`العقل للشات: ${brains(llm.textChain)}`);
+note(`الصوت: ${tts.provider}${tts.provider === 'gemini' ? ` / ${[tts.gemini.model, ...tts.gemini.fallbackModels].join(' ← ')} / ${tts.gemini.voice}` : ''}${backup(tts.fallbacks.join(' ← '))}`);
 
 console.log('\n--- تجربة المفاتيح ---');
 const { askAI } = await import('./llm.js');

@@ -4,7 +4,7 @@
 import { config, log } from './config.js';
 import { fillTemplate, wantsFreshInfo } from './helpers.js';
 import { extractNotes, forgetAll, memoryBlock, saveNotes } from './people.js';
-import { GEMINI_API, PROVIDER_NAMES, apiError, apiRequest, isResting, rest, shortError } from './speech.js';
+import { GEMINI_API, PROVIDER_NAMES, apiError, apiRequest, isResting, rest, restLeft, shortError } from './speech.js';
 
 const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
@@ -14,7 +14,8 @@ const memories = new Map();
 // Voice needs speed: ask thinking models to think briefly and return only the answer.
 // If a model rejects these options, stop sending them.
 let sendGroqReasoning = true;
-const rejectedLevels = new Set(); // thinking levels this model refused
+const rejectedLevels = new Map(); // model -> thinking levels that model refused
+const refused = (model) => rejectedLevels.get(model) ?? new Set();
 let searchOffUntil = 0; // Google Search through Gemini failed (not supported / its own limit): skip it until then
 
 export function resetMemory(guildId) {
@@ -90,7 +91,7 @@ export async function askAI({ guildId, chatKey, medium = 'voice', peer = false, 
   const search = mode === 'always' || asked || (mode !== 'off' && Date.now() < (memory.searchUntil ?? 0));
   if (asked) memory.searchUntil = Date.now() + 90_000;
   const raw = stripNamePrefix(
-    await createReply(system, [...memory.messages, question], onNotice, { search, slow: asked }),
+    await createReply(system, [...memory.messages, question], onNotice, { search, slow: asked, medium }),
     [speaker, config.botName],
   );
   // The hidden memory note never reaches the voice or the chat; it is saved instead.
@@ -107,13 +108,20 @@ export async function askAI({ guildId, chatKey, medium = 'voice', peer = false, 
 
 const label = (name) => PROVIDER_NAMES[name] ?? config.llm.extras[name]?.label ?? name;
 
-async function createReply(system, messages, onNotice, { search = false, slow = false } = {}) {
+async function createReply(system, messages, onNotice, { search = false, slow = false, medium = 'voice' } = {}) {
   // A search takes longer, and the other brains can't search, so they wait longer before joining in.
   const hedgeMs = slow ? config.llm.searchHedgeMs : config.llm.hedgeMs;
-  const options = { search };
-  // Brains that are resting (a used-up limit...) are skipped; if all of them rest, try them all anyway.
-  const awake = config.llm.chain.filter((name) => !isResting(`llm:${name}`));
-  const order = awake.length ? awake : config.llm.chain;
+  const options = { search, medium };
+  // The voice and the written chat ask the brains in different orders (so the chat doesn't use up the voice's limits).
+  const base = medium === 'text' ? config.llm.textChain : config.llm.chain;
+  // Only Gemini can search, so a question about news/weather goes to it first.
+  const chain = search && base.includes('gemini') ? ['gemini', ...base.filter((name) => name !== 'gemini')] : base;
+  // Brains that are resting (a used-up limit...) are skipped. If all of them rest, only the two that wake up
+  // soonest are tried (not every one: each failure costs time).
+  const awake = chain.filter((name) => !isResting(`llm:${name}`));
+  const order = awake.length
+    ? awake
+    : [...chain].sort((a, b) => restLeft(`llm:${a}`) - restLeft(`llm:${b}`)).slice(0, 2);
   return raceChain(
     order,
     (name) => replyFrom(name, system, messages, options),
@@ -178,19 +186,24 @@ function brainNotice(provider, fallback, error) {
 
 function replyFrom(provider, system, messages, options = {}) {
   if (provider === 'gemini') return geminiReply(system, messages, options);
-  if (provider === 'groq') return groqReply(system, messages);
-  return compatReply(provider, system, messages);
+  if (provider === 'groq') return groqReply(system, messages, options.medium);
+  return compatReply(provider, system, messages, options.medium);
+}
+
+/** How long a reply may be (in tokens). Groq counts this room against its per-minute limit, so the voice keeps it small. */
+function replyRoom(medium) {
+  return medium === 'text' ? config.llm.groq.textMaxTokens : config.llm.groq.maxTokens;
 }
 
 // ---------- Gemini ----------
 function thinkingLevel(model, setting) {
-  if (['minimal', 'low', 'medium', 'high'].includes(setting)) return rejectedLevels.has(setting) ? null : setting;
+  if (['minimal', 'low', 'medium', 'high'].includes(setting)) return refused(model).has(setting) ? null : setting;
   if (['off', 'none'].includes(setting) || /^gemini-[12]\./.test(model)) return null;
   // Flash-Lite already thinks very little; Flash thinks "medium" unless told otherwise.
   // Voice wants the fastest answer, so "minimal" (retried without it if the model refuses).
   // Fastest first; if the model refuses a level, the next one is tried.
   if (/lite/.test(model)) return null;
-  return ['minimal', 'low'].find((level) => !rejectedLevels.has(level)) ?? null;
+  return ['minimal', 'low'].find((level) => !refused(model).has(level)) ?? null;
 }
 
 async function geminiReply(system, messages, { search = false } = {}) {
@@ -221,7 +234,7 @@ async function geminiReply(system, messages, { search = false } = {}) {
     }
     if (res.status === 400 && level && /think/i.test(error.body)) {
       log.warn(`الموديل ${model} ما يقبل thinkingLevel=${level} — بجرب مستوى ثاني. (${shortError(error)})`);
-      rejectedLevels.add(level);
+      rejectedLevels.set(model, new Set([...refused(model), level]));
       continue;
     }
     throw error;
@@ -248,8 +261,9 @@ function reasoningOptions(model) {
   return {};
 }
 
-async function groqReply(system, messages) {
-  const { apiKey, model, maxTokens } = config.llm.groq;
+async function groqReply(system, messages, medium = 'voice') {
+  const { apiKey, model } = config.llm.groq;
+  const maxTokens = replyRoom(medium);
   for (let attempt = 0; attempt < 3; attempt++) {
     const body = {
       model,
@@ -285,22 +299,36 @@ async function groqReply(system, messages) {
 // ---------- Extra brains (OpenAI chat format: Cerebras, OpenRouter, Mistral, SambaNova, custom) ----------
 const refusedOptions = new Set(); // brains that rejected the "think briefly" option
 
+/** "Think briefly" for the models that think (fast replies); nothing for the others. */
 function compatOptions(name, model) {
-  if (refusedOptions.has(name) || !/gpt-oss/i.test(model)) return {};
-  return name === 'openrouter' ? { reasoning: { effort: 'low' } } : { reasoning_effort: 'low' };
+  if (refusedOptions.has(name)) return {};
+  const brain = config.llm.extras[name];
+  if (/gpt-oss/i.test(model)) {
+    if (name === 'openrouter') return { reasoning: { effort: 'low' } };
+    return brain?.shares === 'groq' ? { reasoning_effort: 'low', include_reasoning: false } : { reasoning_effort: 'low' };
+  }
+  if (/^qwen\//i.test(model) && brain?.shares === 'groq') return { reasoning_effort: 'none', reasoning_format: 'hidden' };
+  if (brain?.shares === 'gemini' && !/lite/i.test(model)) return { reasoning_effort: 'low' };
+  return {};
 }
 
-async function compatReply(name, system, messages) {
+async function compatReply(name, system, messages, medium = 'voice') {
   const brain = config.llm.extras[name];
   const what = `AI (${brain.label})`;
+  // Gemini's thinking counts inside the reply's room, so it gets more; Groq-style services get the small voice room.
+  const maxTokens = brain.maxTokens || (brain.shares === 'gemini' ? 1024 : replyRoom(medium));
   for (let attempt = 0; attempt < 2; attempt++) {
     const res = await apiRequest(brain.url, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${brain.apiKey}`, 'Content-Type': 'application/json' },
+      headers: {
+        Authorization: `Bearer ${brain.apiKey}`,
+        ...(brain.shares === 'gemini' ? { 'x-goog-api-key': brain.apiKey } : {}),
+        'Content-Type': 'application/json',
+      },
       body: JSON.stringify({
         model: brain.model,
         messages: [{ role: 'system', content: system }, ...messages],
-        max_tokens: brain.maxTokens,
+        max_tokens: maxTokens,
         ...compatOptions(name, brain.model),
       }),
     });
@@ -334,7 +362,7 @@ function stripNamePrefix(text, names) {
 /** Drop any "thinking" the model may have written into its answer. */
 function cleanReply(text) {
   return String(text ?? '')
-    .replace(/<think>[\s\S]*?<\/think>/g, '')
+    .replace(/<think>[\s\S]*?(?:<\/think>|$)/g, '') // thinking that was cut off (no closing tag) is never spoken
     .replace(/\s*\[\d+(?:\s*[,،-]\s*\d+)*\]/g, '') // search citation marks like [1] or [2, 3]
     .trim();
 }

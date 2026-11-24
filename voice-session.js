@@ -28,6 +28,8 @@ import {
   isRepetitionLoop,
   isSalam,
   isStopCommand,
+  isStopForHer,
+  looksLikeQuestion,
   joinNames,
   liveAudioStream,
   looksLikeNoise,
@@ -101,6 +103,8 @@ export class VoiceSession {
     this.pending = 0;
     this.listening = new Set(); // users being recorded right now
     this.lastAnswer = new Map(); // userId -> when the bot last answered them
+    this.salamAnswered = new Map(); // userId -> when she last answered their "السلام عليكم"
+    this.lastSalamAt = 0;
     this.lastErrorAt = new Map();
     this.debugLines = [];
     this.connected = false;
@@ -239,10 +243,17 @@ export class VoiceSession {
     log.info(`🗣️  ${member.displayName}: ${text}`);
     if (config.rememberPeople) recordVoice(this.guild.id, { id: member.id, name: member.displayName });
 
+    const called = containsWakeWord(text, config.wakeWords);
     if (isStopCommand(text, config.stopWords, config.wakeWords)) {
+      // "بس" / "خلاص" between other people in a big room is not for her: she carries on.
+      const forHer = called || isStopForHer(text) || userId === this.currentSpeaker || this.smallRoom();
       if (this.isBusy()) {
-        this.stop();
-        log.info('⏹️  سكتت');
+        if (forHer) {
+          this.stop();
+          log.info('⏹️  سكتت');
+        } else {
+          log.info(`🙉 "${text}" مب لي — كملت كلامي`);
+        }
       }
       return;
     }
@@ -253,14 +264,17 @@ export class VoiceSession {
       return;
     }
 
-    const called = containsWakeWord(text, config.wakeWords);
     const salam = isSalam(text, config.wakeWords);
-    const followUp =
-      this.smallRoom() && Date.now() - (this.lastAnswer.get(userId) ?? 0) < config.followUpSeconds * 1000;
+    // Carrying on without her name: in a small room for a while; in a big room only the one she just answered,
+    // for a few seconds, with a question.
+    const since = Date.now() - (this.lastAnswer.get(userId) ?? 0);
+    const followUp = this.smallRoom()
+      ? since < config.followUpSeconds * 1000
+      : since < config.followUpBigSeconds * 1000 && looksLikeQuestion(text);
     // While the bot talks, only react when called by name (avoids echo and cross-talk).
     if (startedWhileTalking && !called) return;
-    // Someone alone with her who says "السلام عليكم" is talking to her, even without her name.
-    const greeting = salam && this.humans().length <= 1;
+    // "السلام عليكم" gets "وعليكم السلام" in any room (once in a while per person).
+    const greeting = salam && this.canGreet(userId);
     if (getMode(this.guild.id) === 'name' && !called && !followUp && !greeting) {
       log.info(`🙈 ما ذكر اسمي (${config.botName}) — تجاهلته`);
       return;
@@ -274,6 +288,8 @@ export class VoiceSession {
       return;
     }
     if (salam) {
+      this.salamAnswered.set(userId, Date.now());
+      this.lastSalamAt = Date.now();
       this.enqueue(async (gen) => {
         await this.speakTo(userId, pickOne(SALAM_REPLIES), gen);
         this.lastAnswer.set(userId, Date.now());
@@ -368,6 +384,13 @@ export class VoiceSession {
     }, config.welcomeDelayMs);
   }
 
+  /** Answer this "السلام عليكم"? Alone with her: always. In a busy room: once in a while per person, one answer for a group. */
+  canGreet(userId) {
+    if (this.humans().length <= 1) return true;
+    if (Date.now() - (this.salamAnswered.get(userId) ?? 0) < config.salamCooldownSeconds * 1000) return false;
+    return Date.now() - this.lastSalamAt > 15_000;
+  }
+
   /**
    * Does talking over her make her stop? In a room of two, anyone can. In a bigger room only the person
    * she is talking to can (everyone else is chatting with each other, and that must not cut her off).
@@ -390,11 +413,17 @@ export class VoiceSession {
   /** The AI could not answer: say so out loud (once in a while), instead of staying silent. */
   async sorry(gen) {
     if (Date.now() - this.lastSorryAt < 30_000 || gen !== this.generation || this.destroyed) return;
+    if (this.pending > 1) return; // others are waiting for an answer: answer them instead of apologising
     this.lastSorryAt = Date.now();
     await this.speak(pickOne(SORRY), gen);
   }
 
   async answer(member, text, gen, timing) {
+    // She was busy so long that the answer would come far too late (and confuse everyone): drop it.
+    if (timing && Date.now() - timing.heardAt > config.staleSeconds * 1000) {
+      log.info(`⌛ سؤال ${member.displayName} انتظر أكثر من ${config.staleSeconds} ثانية — تركته`);
+      return;
+    }
     this.currentSpeaker = member.id;
     try {
       await this.answerNow(member, text, gen, timing);

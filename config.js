@@ -28,6 +28,8 @@ const list = (name, fallback) =>
     .split(/[,،]/)
     .map((s) => s.trim())
     .filter(Boolean);
+/** A list of model names; "none" means no models. */
+const models = (name, fallback) => list(name, fallback).filter((m) => !['none', 'off', 'false', 'no'].includes(m.toLowerCase()));
 
 const DEFAULT_PROMPT = `أنتِ {{BOT_NAME}}، مساعدة ذكاء اصطناعي صوتية في روم صوتي في سيرفر ديسكورد "{{SERVER_NAME}}". إذا أحد سألج منو أنتِ، قولي إنج {{BOT_NAME}}.
 ردودج تتحول لصوت، فخليها قصيرة وطبيعية (جملة إلى ثلاث جمل) وبدون إيموجي أو ماركداون أو روابط.
@@ -51,10 +53,16 @@ function loadPrompt() {
 const groqKey = env('GROQ_API_KEY');
 const geminiKey = env('GEMINI_API_KEY') || env('GOOGLE_API_KEY');
 
-// With a Gemini key, Gemini thinks and speaks; Groq listens, and stands in when Gemini can't.
-const llmProvider = lower('LLM_PROVIDER', geminiKey ? 'gemini' : 'groq');
+const azureKey = env('AZURE_SPEECH_KEY');
+
+// Groq listens. The brains are many models (Groq, Gemini and the extra services), each with its own free limit;
+// they are asked in a fast order for the voice and in another order for the written chat (so the chat never eats the voice's limits).
+// LLM_PROVIDER / LLM_FALLBACK set by hand replace that order with your own.
+const llmChosen = lower('LLM_PROVIDER');
+const llmProvider = llmChosen || (geminiKey ? 'gemini' : 'groq');
 const sttProvider = lower('STT_PROVIDER', 'groq');
-const ttsProvider = lower('TTS_PROVIDER', geminiKey ? 'gemini' : 'groq');
+// The voice: Azure's Emirati voice is the clearest and fastest, so it speaks first when its key is set; then Gemini, then Groq.
+const ttsProvider = lower('TTS_PROVIDER', azureKey ? 'azure' : geminiKey ? 'gemini' : 'groq');
 
 /** Several backups in order ("azure,groq"); with `none` there are none. */
 function backupsFor(name, provider, fallback) {
@@ -67,19 +75,28 @@ function backupsFor(name, provider, fallback) {
   return out;
 }
 
-// Voice backups: Azure's Emirati voice first when its key is there, then Groq.
-const ttsBackups = backupsFor('TTS_FALLBACK', ttsProvider, env('AZURE_SPEECH_KEY') ? 'azure,groq' : 'groq');
+// Voice backups, in order: Gemini, Azure, Groq (each one only when its key is there).
+const ttsBackups = backupsFor(
+  'TTS_FALLBACK',
+  ttsProvider,
+  [geminiKey && 'gemini', azureKey && 'azure', groqKey && 'groq'].filter(Boolean).join(',') || 'none',
+);
 
 // More brains that speak the OpenAI chat format. Each one joins the backup chain by itself as soon as its key is set.
 const GROQ_CHAT = 'https://api.groq.com/openai/v1/chat/completions';
+const GEMINI_CHAT = 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions';
 const EXTRA_BRAINS = {
-  // Groq counts its free limits per model, so each of these has its own limit (same GROQ_API_KEY, no extra key needed).
-  groq70b: { label: 'Groq Llama 70B', url: GROQ_CHAT, model: 'llama-3.3-70b-versatile', sharesGroqKey: true },
+  // Groq and Gemini count their free limits per model, so each of these models has its own limit
+  // (with the same GROQ_API_KEY / GEMINI_API_KEY, no new key). <NAME>_CHAT_MODEL=none turns one off.
+  groq20b: { label: 'Groq gpt-oss-20b', url: GROQ_CHAT, model: 'openai/gpt-oss-20b', shares: 'groq' },
+  groqqwen: { label: 'Groq Qwen', url: GROQ_CHAT, model: 'qwen/qwen3.8-27b', shares: 'groq' },
+  geminilite: { label: 'Gemini 3.1 Flash-Lite', url: GEMINI_CHAT, model: 'gemini-3.1-flash-lite', shares: 'gemini' },
+  geminiflash: { label: 'Gemini 3.6 Flash', url: GEMINI_CHAT, model: 'gemini-3.6-flash', shares: 'gemini' },
+  gemini38: { label: 'Gemini 3.8 Flash', url: GEMINI_CHAT, model: 'gemini-3.8-flash', shares: 'gemini' },
   cerebras: { label: 'Cerebras', url: 'https://api.cerebras.ai/v1/chat/completions', model: 'gpt-oss-120b' },
   openrouter: { label: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions', model: 'openrouter/free' },
   mistral: { label: 'Mistral', url: 'https://api.mistral.ai/v1/chat/completions', model: 'mistral-small-latest' },
   sambanova: { label: 'SambaNova', url: 'https://api.sambanova.ai/v1/chat/completions', model: 'Meta-Llama-3.3-70B-Instruct' },
-  groq8b: { label: 'Groq Llama 8B', url: GROQ_CHAT, model: 'llama-3.1-8b-instant', sharesGroqKey: true },
   // Any other OpenAI-compatible service: CUSTOM_LLM_URL (the full .../chat/completions address), CUSTOM_LLM_API_KEY, CUSTOM_LLM_MODEL.
   custom: { label: 'Custom', url: env('CUSTOM_LLM_URL'), model: env('CUSTOM_LLM_MODEL') },
 };
@@ -92,17 +109,43 @@ const extraBrains = Object.fromEntries(
         label: brain.label,
         keyName: name === 'custom' ? 'CUSTOM_LLM_API_KEY' : `${upper}_API_KEY`,
         url: env(`${upper}_CHAT_URL`, brain.url),
-        apiKey: env(name === 'custom' ? 'CUSTOM_LLM_API_KEY' : `${upper}_API_KEY`) || (brain.sharesGroqKey ? groqKey : ''),
+        apiKey:
+          env(name === 'custom' ? 'CUSTOM_LLM_API_KEY' : `${upper}_API_KEY`) ||
+          (brain.shares === 'groq' ? groqKey : brain.shares === 'gemini' ? geminiKey : ''),
         model: env(name === 'custom' ? 'CUSTOM_LLM_MODEL' : `${upper}_CHAT_MODEL`, brain.model),
-        maxTokens: num('EXTRA_MAX_TOKENS', 1024),
+        shares: brain.shares ?? '',
+        maxTokens: num('EXTRA_MAX_TOKENS', 0), // 0 = the usual size for the voice / the chat
       },
     ];
   }),
 );
-const extraNames = Object.keys(extraBrains).filter((name) => extraBrains[name].apiKey && extraBrains[name].url && extraBrains[name].model);
+const geminiChatModel = env('GEMINI_CHAT_MODEL', 'gemini-3.5-flash-lite');
+const groqChatModel = env('GROQ_CHAT_MODEL', 'openai/gpt-oss-120b');
+const mainModel = { gemini: geminiChatModel, groq: groqChatModel };
+const extraNames = Object.keys(extraBrains).filter((name) => {
+  const brain = extraBrains[name];
+  if (!brain.apiKey || !brain.url || !brain.model || brain.model.toLowerCase() === 'none') return false;
+  return !brain.shares || brain.model !== mainModel[brain.shares]; // the same model twice would share one limit
+});
 
-// The brain's backups, in order: Groq, then every extra brain that has a key.
-const llmBackups = backupsFor('LLM_FALLBACK', llmProvider, [groqKey && 'groq', ...extraNames].filter(Boolean).join(',') || 'none');
+// Voice: Gemini Flash-Lite first (fast, and the best Emirati dialect for its speed); if it is slow, Groq joins and the
+// first answer wins; then the other models.
+const VOICE_ORDER = ['gemini', 'groq', 'geminilite', 'groq20b', 'groqqwen', 'mistral', 'geminiflash', 'cerebras', 'openrouter', 'sambanova', 'gemini38', 'custom'];
+// Written chat: other models first, so the voice keeps its limits.
+const TEXT_ORDER = ['geminilite', 'geminiflash', 'groqqwen', 'mistral', 'groq20b', 'openrouter', 'gemini', 'cerebras', 'sambanova', 'groq', 'gemini38', 'custom'];
+const hasBrain = (name) => (name === 'gemini' ? !!geminiKey : name === 'groq' ? !!groqKey : extraNames.includes(name));
+
+function brainChain(order) {
+  if (!llmChosen && !env('LLM_FALLBACK')) return order.filter(hasBrain);
+  // Chosen by hand: the main brain first, then LLM_FALLBACK (or the usual order).
+  const backups = env('LLM_FALLBACK')
+    ? backupsFor('LLM_FALLBACK', llmProvider, env('LLM_FALLBACK'))
+    : order.filter((name) => name !== llmProvider && hasBrain(name));
+  return [llmProvider, ...backups];
+}
+const voiceBrains = brainChain(VOICE_ORDER);
+const textBrains = brainChain(TEXT_ORDER);
+const llmBackups = voiceBrains.slice(1);
 
 const botName = env('BOT_NAME', 'فطوم');
 
@@ -114,13 +157,15 @@ export const config = {
   wakeWords: [...new Set([botName, ...list('WAKE_WORDS', 'فطوم,فطومه,فطومي,فاطوم,بوت,bot')])],
   // What the bot says when it is only called by name.
   ackReplies: list('ACK_REPLIES', 'ها حياتي,هلا ابوي تفضل,ها عيوني شي؟'),
-  stopWords: list('STOP_WORDS', 'اسكت,خلاص,بس,وقف,كفايه,stop'),
+  // Words that make her stop talking. Said to her (her name, or "اسكتي/وقفي"), by the one she is answering, or in a room of two;
+  // "بس" / "خلاص" between other people in a big room doesn't stop her.
+  stopWords: list('STOP_WORDS', 'اسكتي,سكتي,اسكت,وقفي,وقف,خلاص,بس,بسج,كفايه,stop'),
   replyMode: lower('REPLY_MODE', 'name'), // name | everyone
   // Written chat: the channels she chats in (IDs, comma separated; 'none' = no written chat). Needs "Message Content Intent".
   textChannelIds: list('TEXT_CHANNEL_IDS', '1557103411579850852').filter((id) => /^\d{15,25}$/.test(id)),
   textReplyMode: lower('TEXT_REPLY_MODE', 'questions'), // name = only when called | questions = also questions | everyone = every message
   textFollowUpSeconds: num('TEXT_FOLLOWUP_SECONDS', 45), // after she answers someone, their next messages need no name
-  textCooldownSeconds: num('TEXT_COOLDOWN_SECONDS', 8), // minimum gap between answers nobody asked her for
+  textCooldownSeconds: num('TEXT_COOLDOWN_SECONDS', 15), // minimum gap between answers nobody asked her for
   // Bots she chats with (names or IDs): they get an answer only when they talk to her, a few turns in a row at most.
   friendBots: list('FRIEND_BOTS', 'حسون,hassoun'),
   textBotChainMax: num('TEXT_BOT_CHAIN_MAX', 3),
@@ -128,6 +173,12 @@ export const config = {
   followUpSeconds: num('FOLLOWUP_SECONDS', 15),
   // Talking on without the name only works when the room has at most this many people.
   followUpMaxPeople: num('FOLLOWUP_MAX_PEOPLE', 2),
+  // In a bigger room, the one she just answered can ask one more question without her name within this time.
+  followUpBigSeconds: num('FOLLOWUP_BIG_SECONDS', 10),
+  // A question still waiting this long (she was busy) is dropped instead of being answered late.
+  staleSeconds: num('STALE_SECONDS', 40),
+  // "السلام عليكم": she answers it in any room, once in this time per person.
+  salamCooldownSeconds: num('SALAM_COOLDOWN_SECONDS', 600),
   autoJoinChannelId: env('AUTO_JOIN_CHANNEL_ID'),
   leaveWhenAloneSeconds: num('LEAVE_WHEN_ALONE_SECONDS', 60),
   // The bot writes in the voice room's text chat only when this is true; otherwise everything goes to the logs.
@@ -141,8 +192,8 @@ export const config = {
   welcomeReplies: list('WELCOME_REPLIES', 'هلا والله {name},يا هلا والله {name},هلا {name} مرحبا'),
   welcomeCooldownSeconds: num('WELCOME_COOLDOWN_SECONDS', 180), // no second hello to the same person within this time
   welcomeDelayMs: num('WELCOME_DELAY_MS', 1200), // wait a moment so people who come in together get one hello
-  // Stop talking when someone talks over her (works for the person she is answering, and in small rooms).
-  bargeIn: bool('BARGE_IN', true),
+  // Stop talking when someone talks over her. Off: she finishes her sentence; "فطوم اسكتي" still stops her.
+  bargeIn: bool('BARGE_IN', false),
   bargeInMs: num('BARGE_IN_MS', 500), // how long they must speak before she stops (ignores coughs and clicks)
   // "فطوم روحي روم القهوة": move to another voice room on request.
   moveByVoice: bool('MOVE_BY_VOICE', true),
@@ -158,10 +209,11 @@ export const config = {
 
   // The brain: Gemini or a Groq chat model.
   llm: {
-    provider: llmProvider,
+    provider: voiceBrains[0] ?? llmProvider,
     fallbacks: llmBackups, // tried in this order when the main brain fails or is slow
     fallback: llmBackups[0] ?? '',
-    chain: [llmProvider, ...llmBackups],
+    chain: voiceBrains, // the voice's order
+    textChain: textBrains, // the written chat's order
     extras: extraBrains,
     hedgeMs: num('LLM_HEDGE_MS', 1000), // if the main brain is slower than this, the backup starts too and the first answer wins (0 = off)
     // Fresh facts (news, weather, prices...) from Google Search through Gemini: auto = only for questions that need it, always, or off.
@@ -170,14 +222,17 @@ export const config = {
     searchHedgeMs: num('SEARCH_HEDGE_MS', 8000), // a search takes longer, so the backup brain (no search) waits longer
     gemini: {
       apiKey: geminiKey,
-      model: env('GEMINI_CHAT_MODEL', 'gemini-3.8-flash'),
+      // Flash-Lite: fast, and its free limit is about 500 a day (3.8 Flash only gets 20, so it is a late backup).
+      model: geminiChatModel,
       thinking: lower('GEMINI_THINKING', 'auto'), // auto | minimal | low | medium | high
       maxTokens: num('GEMINI_MAX_TOKENS', 2048),
     },
     groq: {
       apiKey: groqKey,
-      model: env('GROQ_CHAT_MODEL', 'openai/gpt-oss-120b'),
-      maxTokens: num('MAX_REPLY_TOKENS', 1024),
+      model: groqChatModel,
+      // Groq counts the reply's room against its per-minute limit, so short voice replies get a small room.
+      maxTokens: num('MAX_REPLY_TOKENS', 400),
+      textMaxTokens: num('TEXT_MAX_REPLY_TOKENS', 700),
     },
     // Short memory keeps each request small (free plans limit tokens per minute).
     memoryTurns: num('MEMORY_TURNS', 6),
@@ -199,8 +254,14 @@ export const config = {
           apiKey: groqKey,
           model: env('STT_MODEL', 'whisper-large-v3-turbo'),
           // Groq counts the free limit (20 requests a minute) per model, so a second model doubles it.
-          fallbackModels: list('STT_FALLBACK_MODELS', 'whisper-large-v3'),
+          fallbackModels: models('STT_FALLBACK_MODELS', 'whisper-large-v3'),
         }),
+    // Last backup ears: Mistral's Voxtral (with MISTRAL_API_KEY; STT_MISTRAL=false turns it off).
+    mistral: {
+      apiKey: bool('STT_MISTRAL', true) ? env('MISTRAL_API_KEY') : '',
+      url: 'https://api.mistral.ai/v1/audio/transcriptions',
+      model: env('MISTRAL_STT_MODEL', 'voxtral-mini-latest'),
+    },
   },
 
   tts: {
@@ -212,6 +273,10 @@ export const config = {
     gemini: {
       apiKey: geminiKey,
       model: env('GEMINI_TTS_MODEL', 'gemini-3.8-flash-tts'),
+      // Each Gemini voice model has its own free limit: when one is used up, the next one speaks (same voice).
+      fallbackModels: models('GEMINI_TTS_FALLBACK_MODELS', 'gemini-3.8-flash-lite-tts,gemini-3.1-flash-tts-preview').filter(
+        (model) => model !== env('GEMINI_TTS_MODEL', 'gemini-3.8-flash-tts'),
+      ),
       // auto = design a young Emirati woman's voice once and reuse it;
       // or a ready voice (Leda, Kore, Aoede, Zephyr, Sulafat…) or a voice ID (voice_…).
       voice: env('GEMINI_VOICE', 'auto'),
@@ -226,7 +291,7 @@ export const config = {
       voiceEn: env('GROQ_VOICE_EN', 'hannah'),
     },
     azure: {
-      apiKey: env('AZURE_SPEECH_KEY'),
+      apiKey: azureKey,
       region: env('AZURE_SPEECH_REGION', 'uaenorth'),
       voiceAr: env('AZURE_VOICE_AR', 'ar-AE-FatimaNeural'),
       voiceEn: env('AZURE_VOICE_EN', 'en-US-JennyNeural'),
