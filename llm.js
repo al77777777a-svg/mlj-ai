@@ -2,6 +2,7 @@
 // If Gemini can't answer (for example its free limit is used up), Groq answers instead for a while.
 import { config, log } from './config.js';
 import { fillTemplate } from './helpers.js';
+import { extractNotes, forgetAll, memoryBlock, saveNotes } from './people.js';
 import { GEMINI_API, PROVIDER_NAMES, apiError, apiRequest, isResting, rest, shortError } from './speech.js';
 
 const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions';
@@ -17,6 +18,9 @@ const rejectedLevels = new Set(); // thinking levels this model refused
 export function resetMemory(guildId) {
   memories.delete(guildId);
 }
+
+/** Forget what she saved about the people and the server (the /forget command). */
+export { forgetAll };
 
 function memoryFor(guildId) {
   const maxAge = config.llm.memoryMinutes * 60_000;
@@ -41,17 +45,24 @@ function now() {
  * `onNotice(message)` is called if the backup brain has to step in.
  * Returns the reply text ('' if the AI had nothing to say).
  */
-export async function askAI({ guildId, speaker, text, vars = {}, onNotice }) {
+export async function askAI({ guildId, speaker, speakerId, room = [], text, vars = {}, onNotice }) {
   const memory = memoryFor(guildId);
   const question = { role: 'user', content: `${speaker}: ${text}` };
-  const system = fillTemplate(config.systemPrompt, {
-    BOT_NAME: config.botName,
-    TIMEZONE: config.timezone,
-    NOW: now(),
-    ...vars,
-  });
+  // Who is in the room (the speaker always counts) and what is already known about them.
+  const here = room.some((p) => p.id === speakerId) || !speakerId ? room : [...room, { id: speakerId, name: speaker }];
+  const people = here.length ? here : [{ id: speakerId ?? speaker, name: speaker }];
+  const system =
+    fillTemplate(config.systemPrompt, {
+      BOT_NAME: config.botName,
+      TIMEZONE: config.timezone,
+      NOW: now(),
+      ...vars,
+    }) + (config.rememberPeople ? `\n\n${memoryBlock(guildId, people)}` : '');
 
-  const reply = stripNamePrefix(await createReply(system, [...memory.messages, question], onNotice), [speaker, config.botName]);
+  const raw = stripNamePrefix(await createReply(system, [...memory.messages, question], onNotice), [speaker, config.botName]);
+  // The hidden memory note never reaches the voice or the chat; it is saved instead.
+  const { text: reply, notes } = extractNotes(raw);
+  if (config.rememberPeople && notes.length) saveNotes(guildId, notes, people);
   if (reply) {
     memory.messages.push(question, { role: 'assistant', content: reply });
     const max = Math.max(2, config.llm.memoryTurns * 2);

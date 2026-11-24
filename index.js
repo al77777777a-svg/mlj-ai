@@ -15,7 +15,7 @@ import path from 'node:path';
 import { generateDependencyReport } from '@discordjs/voice';
 import { ROOT, config, log, validateConfig } from './config.js';
 import { VoiceSession, getMode, setMode } from './voice-session.js';
-import { askAI, resetMemory } from './llm.js';
+import { askAI, forgetAll, resetMemory } from './llm.js';
 
 const problems = validateConfig();
 if (problems.length) {
@@ -64,6 +64,8 @@ const commands = [
   new SlashCommandBuilder().setName('stop').setDescription('يسكت البوت ويلغي الردود اللي بالانتظار'),
 
   new SlashCommandBuilder().setName('reset').setDescription('البوت ينسى السالفة ويبدأ من جديد'),
+
+  new SlashCommandBuilder().setName('forget').setDescription('البوت ينسى اللي يعرفه عن الناس والسيرفر'),
 ].map((command) => command.toJSON());
 
 // ---------- Startup ----------
@@ -265,6 +267,8 @@ const handlers = {
     const reply = await askAI({
       guildId: interaction.guildId,
       speaker: interaction.member.displayName,
+      speakerId: interaction.member.id,
+      room: session?.humans() ?? [],
       text: question,
       vars: { SERVER_NAME: interaction.guild.name, CHANNEL_NAME: session?.channel.name ?? '' },
       onNotice: (message) => {
@@ -292,6 +296,11 @@ const handlers = {
   async stop(interaction) {
     sessions.get(interaction.guildId)?.stop();
     return interaction.reply(ephemeral('🤐 سكتت.'));
+  },
+
+  async forget(interaction) {
+    const count = forgetAll(interaction.guildId);
+    return interaction.reply(count ? `🧹 نسيت ${count} معلومة عن الناس والسيرفر.` : 'ما كنت أعرف شي أنساه 🙂');
   },
 
   async reset(interaction) {

@@ -229,6 +229,8 @@ export class VoiceSession {
       reply = await askAI({
         guildId: this.guild.id,
         speaker: member.displayName,
+        speakerId: member.id,
+        room: this.humans(),
         text,
         vars: { SERVER_NAME: this.guild.name, CHANNEL_NAME: this.channel.name },
         onNotice: (notice) => this.say(notice),
@@ -382,6 +384,16 @@ export class VoiceSession {
         ? `نادوني باسمي (**${escapeMarkdown(config.botName)}**) وأرد عليكم بصوت.`
         : 'أرد على أي كلام في الروم.';
     this.say(`🎙️ دشيت الروم وأسمعكم — ${how}\n-# الصوت يتحول لنص عشان أفهمكم، وما ينحفظ.`);
+  }
+
+  /** The people in the voice room right now: [{ id, name }]. */
+  humans() {
+    try {
+      const people = this.channel.members?.filter?.((m) => !m.user?.bot);
+      return people?.map ? people.map((m) => ({ id: m.id, name: m.displayName })) : [];
+    } catch {
+      return [];
+    }
   }
 
   /** Post in the voice channel's text chat (or only write it to the logs, when CHAT_MESSAGES is off). */
