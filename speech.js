@@ -129,8 +129,8 @@ const CHUNK_LIMITS = { gemini: 1500, groq: 190, azure: 400, elevenlabs: 400 };
 
 /** The voice that speaks now: the main one, or the backup while the main one rests. */
 export function activeVoice() {
-  const { provider, fallback } = config.tts;
-  return fallback && isResting(`tts:${provider}`) ? fallback : provider;
+  const order = [config.tts.provider, ...config.tts.fallbacks];
+  return order.find((who) => !isResting(`tts:${who}`)) ?? order[0];
 }
 
 export function ttsChunkLimit() {
@@ -153,7 +153,7 @@ function remember(key, clip) {
  * working and the backup voice takes over, so the room knows why the voice changed.
  */
 export async function synthesize(text, { onNotice } = {}) {
-  const { provider, fallback } = config.tts;
+  const order = [config.tts.provider, ...config.tts.fallbacks];
   const cacheable = text.length <= CACHE_TEXT_MAX;
   const speakWith = async (who) => {
     const key = `${who}:${text}`;
@@ -163,17 +163,25 @@ export async function synthesize(text, { onNotice } = {}) {
     return clip;
   };
 
-  if (cacheable && clips.has(`${provider}:${text}`)) return clips.get(`${provider}:${text}`);
-  if (!fallback || !isResting(`tts:${provider}`)) {
+  if (cacheable && clips.has(`${order[0]}:${text}`)) return clips.get(`${order[0]}:${text}`);
+  // A voice that is resting (its limit is used up...) is skipped; if all of them rest, try them anyway.
+  let queue = order.filter((who) => !isResting(`tts:${who}`));
+  if (!queue.length) queue = order;
+  let failure;
+  for (let i = 0; i < queue.length; i++) {
+    const who = queue[i];
     try {
-      return await speakWith(provider);
+      return await speakWith(who);
     } catch (error) {
-      if (!fallback) throw error;
-      log.warn(`صوت ${PROVIDER_NAMES[provider]} ما اشتغل — بكمل بصوت ${PROVIDER_NAMES[fallback]}: ${shortError(error)}`);
-      if (rest(`tts:${provider}`, error)) onNotice?.(voiceNotice(provider, fallback, error));
+      failure = error;
+      const next = queue[i + 1];
+      const tell = rest(`tts:${who}`, error);
+      if (!next) break;
+      log.warn(`صوت ${PROVIDER_NAMES[who]} ما اشتغل — بكمل بصوت ${PROVIDER_NAMES[next]}: ${shortError(error)}`);
+      if (tell) onNotice?.(voiceNotice(who, next, error));
     }
   }
-  return speakWith(fallback);
+  throw failure;
 }
 
 function voiceNotice(provider, fallback, error) {
@@ -373,8 +381,8 @@ export async function openSpeechStream(text, { onNotice } = {}) {
     // A limited Gemini: rest it, tell the room, and let the backup voice speak (normal path).
     // Anything else means streaming doesn't work here, so don't try it again for a while.
     if (error?.status === 429) {
-      const { fallback } = config.tts;
-      if (fallback && rest('tts:gemini', error)) onNotice?.(voiceNotice('gemini', fallback, error));
+      const next = config.tts.fallbacks.find((who) => !isResting(`tts:${who}`)) ?? config.tts.fallbacks[0];
+      if (next && rest('tts:gemini', error)) onNotice?.(voiceNotice('gemini', next, error));
     } else {
       streamOffUntil = Date.now() + 10 * 60_000;
       log.warn(`بث الصوت من Gemini ما اشتغل — بستخدم الطريقة العادية: ${shortError(error)}`);
@@ -481,7 +489,7 @@ function azureSpeech(text, english) {
     headers: {
       'Ocp-Apim-Subscription-Key': a.apiKey,
       'Content-Type': 'application/ssml+xml',
-      'X-Microsoft-OutputFormat': 'audio-24khz-48kbitrate-mono-mp3',
+      'X-Microsoft-OutputFormat': 'riff-24khz-16bit-mono-pcm',
       'User-Agent': 'discord-voice-ai-bot',
     },
     body: ssml,

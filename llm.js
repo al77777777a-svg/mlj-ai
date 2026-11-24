@@ -209,7 +209,7 @@ function reasoningOptions(model) {
 
 async function groqReply(system, messages) {
   const { apiKey, model, maxTokens } = config.llm.groq;
-  for (let attempt = 0; attempt < 2; attempt++) {
+  for (let attempt = 0; attempt < 3; attempt++) {
     const body = {
       model,
       messages: [{ role: 'system', content: system }, ...messages],
@@ -226,6 +226,11 @@ async function groqReply(system, messages) {
       return cleanReply(data?.choices?.[0]?.message?.content);
     }
     const error = await apiError(res, 'AI (Groq)');
+    // The model sometimes writes an answer Groq can't read back; asking again usually works.
+    if (res.status === 400 && /output_parse_failed|Parsing failed/i.test(error.body ?? error.message)) {
+      log.warn('Groq ما قدر يقرا رد الموديل — بعيد المحاولة.');
+      continue;
+    }
     if (res.status === 400 && sendGroqReasoning && /reason/i.test(error.message)) {
       log.warn(`الموديل ${model} ما يقبل إعدادات التفكير — بكمل بدونها.`);
       sendGroqReasoning = false;

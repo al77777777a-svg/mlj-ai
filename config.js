@@ -64,6 +64,20 @@ function backupFor(name, provider) {
   return value;
 }
 
+/** Several backups in order ("azure,groq"); with `none` there are none. */
+function backupsFor(name, provider, fallback) {
+  const out = [];
+  for (const item of list(name, fallback).map((s) => s.toLowerCase())) {
+    if (['none', 'off', 'false', 'no', 'لا'].includes(item)) return [];
+    if (item === provider || out.includes(item) || (item === 'groq' && !groqKey)) continue;
+    out.push(item);
+  }
+  return out;
+}
+
+// Voice backups: Azure's Emirati voice first when its key is there, then Groq.
+const ttsBackups = backupsFor('TTS_FALLBACK', ttsProvider, env('AZURE_SPEECH_KEY') ? 'azure,groq' : 'groq');
+
 const botName = env('BOT_NAME', 'فطوم');
 
 export const config = {
@@ -149,7 +163,8 @@ export const config = {
 
   tts: {
     provider: ttsProvider,
-    fallback: backupFor('TTS_FALLBACK', ttsProvider),
+    fallbacks: ttsBackups, // tried in this order when the main voice fails (used-up limit...)
+    fallback: ttsBackups[0] ?? '',
     louder: bool('VOICE_LOUDER', true), // raise quiet voices to a normal level
     stream: bool('TTS_STREAM', true), // Gemini voice starts playing while it is still being made
     gemini: {
@@ -221,10 +236,7 @@ export function validateConfig() {
 
   // The voice
   const t = config.tts;
-  for (const [setting, provider] of [
-    ['TTS_PROVIDER', t.provider],
-    ['TTS_FALLBACK', t.fallback],
-  ]) {
+  for (const [setting, provider] of [['TTS_PROVIDER', t.provider], ...t.fallbacks.map((name) => ['TTS_FALLBACK', name])]) {
     if (!provider) continue;
     if (provider === 'gemini') need(t.gemini.apiKey, `GEMINI_API_KEY فاضي — ${GEMINI_HELP}`);
     else if (provider === 'groq') need(t.groq.apiKey, `GROQ_API_KEY فاضي — ${GROQ_HELP}`);

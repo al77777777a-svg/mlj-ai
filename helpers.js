@@ -91,7 +91,7 @@ export function joinNames(names) {
   return list.reduce((out, name, i) => (i === 0 ? name : `${out} و${name}`), '');
 }
 
-const MOVE_VERBS = new Set(['روح', 'روحي', 'رح', 'رحي', 'انتقل', 'انتقلي', 'ادخل', 'ادخلي', 'تعال', 'تعالي', 'اذهب', 'اذهبي']);
+const MOVE_VERBS = new Set(['روح', 'روحي', 'رح', 'رحي', 'سير', 'سيري', 'خش', 'خشي', 'انتقل', 'انتقلي', 'ادخل', 'ادخلي', 'تعال', 'تعالي', 'اذهب', 'اذهبي', 'اطلع', 'اطلعي']);
 const ROOM_WORDS = new Set(['روم', 'رووم', 'غرفه', 'قناه', 'الروم', 'الغرفه', 'القناه', 'room', 'channel', 'voice']);
 const FILLER_WORDS = new Set(['صوتي', 'الصوتي', 'صوتيه', 'الصوتيه', 'حق', 'اللي', 'الي', 'علي', 'في', 'ع', 'عند', 'ل', 'اسمه', 'اسمها', 'ذاك', 'ذيك', 'هذا', 'هذي', 'لو', 'سمحت', 'بسرعه', 'الحين', 'يالله']);
 
@@ -192,6 +192,19 @@ export function looksLikeNoise(text) {
   if (t.replace(/\s/g, '').length < 2) return true;
   if (HALLUCINATIONS.has(t)) return true;
   return t.includes('نانسي قنقر') || t.includes('amara org');
+}
+
+/**
+ * Speech-to-text sometimes loops on noise ("بوت بوت بوت بوس بوت", "اعتقدت اعتقدت اعتقدت اعتقدت"):
+ * one word makes up half of the text or more. Answering it only wastes the free voice limit.
+ */
+export function isRepetitionLoop(text) {
+  const words = tokens(text);
+  if (words.length < 4) return false;
+  const counts = new Map();
+  for (const word of words) counts.set(word, (counts.get(word) ?? 0) + 1);
+  const most = Math.max(...counts.values());
+  return most >= 4 && most / words.length >= 0.5;
 }
 
 /** Remove things that sound bad when read aloud (markdown, links, emoji). */

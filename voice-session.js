@@ -15,7 +15,7 @@ import { ChannelType, PermissionFlagsBits, escapeMarkdown } from 'discord.js';
 import OpusScript from 'opusscript';
 import { config, log } from './config.js';
 import { askAI, pickOption } from './llm.js';
-import { activeVoice, openSpeechStream, synthesize, transcribe, ttsChunkLimit } from './speech.js';
+import { activeVoice, isResting, openSpeechStream, synthesize, transcribe, ttsChunkLimit } from './speech.js';
 import {
   DISCORD_CHANNELS,
   DISCORD_RATE,
@@ -24,6 +24,7 @@ import {
   createUpsampler,
   findVoiceChannel,
   isOnlyWakeWord,
+  isRepetitionLoop,
   isStopCommand,
   joinNames,
   liveAudioStream,
@@ -44,6 +45,7 @@ export const VOICE_PERMISSIONS = [PermissionFlagsBits.ViewChannel, PermissionFla
 const pickOne = (list) => list[Math.floor(Math.random() * list.length)];
 const MOVING = ['تمام، رايحة {room}', 'أبشر، الحين أروح {room}', 'زين، ثواني وأكون في {room}'];
 const NOT_FOUND = ['ما لقيت روم بهذا الاسم، عيدها لي', 'أي روم؟ ما عرفته، قول لي اسمه مرة ثانية'];
+const SORRY = ['ما قدرت أجاوبك الحين، عيدها بعد شوي', 'تعبت شوي، عيد علي بعد لحظة'];
 const SAME_ROOM = ['أنا موجودة في نفس الروم!', 'أنا هنا في نفس الروم يالغالي'];
 const NO_ACCESS = ['ما أقدر أدخل ذاك الروم، ما عندي صلاحية'];
 
@@ -85,7 +87,8 @@ export class VoiceSession {
     this.welcomed = new Map(); // userId -> when she last said hello to them
     this.welcomeNames = new Map(); // userId -> name, waiting for the hello
     this.welcomeTimer = null;
-    this.currentSpeaker = null; // the person she is answering right now
+    this.currentSpeaker = null; // the person she is talking to right now (only they can stop her in a busy room)
+    this.lastSorryAt = 0;
     this.connection = null;
     this.player = createAudioPlayer();
     this.player.on('error', (err) => log.error('مشغل الصوت:', err.message));
@@ -186,12 +189,13 @@ export class VoiceSession {
         bytes += pcm.length;
       }
       if (bytes >= maxBytes) finish();
-      else if (pcm && !interrupted && pcmDurationMs(bytes) >= nextBargeCheckMs) {
-        // They keep talking while she talks: she stops and listens (a cough or a click is too short to count).
+      else if (pcm && startedWhileTalking && !interrupted && pcmDurationMs(bytes) >= nextBargeCheckMs) {
+        // They began talking while she was talking and keep going: she stops and listens
+        // (a cough or a click is too short to count).
         if (this.isTalking() && this.canBargeIn(userId) && rms(Buffer.concat(chunks)) >= config.minVolume) {
           interrupted = true;
           this.stop();
-          log.info('✋ قاطعوها — سكتت');
+          log.info(`✋ ${this.guild.members.cache.get(userId)?.displayName ?? userId} قاطعها — سكتت`);
         } else {
           nextBargeCheckMs += 250;
         }
@@ -236,6 +240,12 @@ export class VoiceSession {
       return;
     }
 
+    // Noise the speech-to-text turned into a loop of one word: not worth an answer (and a voice request).
+    if (isRepetitionLoop(text) && !isOnlyWakeWord(text, config.wakeWords)) {
+      log.debug('كلام مكرر (غالباً ضوضاء) — تجاهلته');
+      return;
+    }
+
     const called = containsWakeWord(text, config.wakeWords);
     const followUp =
       this.smallRoom() && Date.now() - (this.lastAnswer.get(userId) ?? 0) < config.followUpSeconds * 1000;
@@ -245,7 +255,7 @@ export class VoiceSession {
 
     if (isOnlyWakeWord(text, config.wakeWords)) {
       this.enqueue(async (gen) => {
-        await this.speak(ACKS[Math.floor(Math.random() * ACKS.length)], gen);
+        await this.speakTo(userId, pickOne(ACKS), gen);
         this.lastAnswer.set(userId, Date.now());
       });
       return;
@@ -309,7 +319,8 @@ export class VoiceSession {
    * `people` = [{ id, name }]. People who come in together get one hello.
    */
   welcome(people) {
-    if (!config.welcome || this.destroyed) return;
+    // A hello is a luxury: with the main voice resting, the backup's small free limit is kept for answers.
+    if (!config.welcome || this.destroyed || isResting(`tts:${config.tts.provider}`)) return;
     const cooldown = config.welcomeCooldownSeconds * 1000;
     for (const person of people) {
       if (!person?.id || Date.now() - (this.welcomed.get(person.id) ?? 0) < cooldown) continue;
@@ -333,11 +344,30 @@ export class VoiceSession {
     }, config.welcomeDelayMs);
   }
 
-  /** Does talking over her make her stop? Yes for the person she is answering, and in small rooms. */
+  /**
+   * Does talking over her make her stop? In a room of two, anyone can. In a bigger room only the person
+   * she is talking to can (everyone else is chatting with each other, and that must not cut her off).
+   */
   canBargeIn(userId) {
     if (!config.bargeIn) return false;
-    const recent = Date.now() - (this.lastAnswer.get(userId) ?? 0) < config.followUpSeconds * 1000;
-    return this.smallRoom() || recent || this.currentSpeaker === userId;
+    return this.smallRoom() || this.currentSpeaker === userId;
+  }
+
+  /** Speak to one person (so they are the one who can interrupt her). */
+  async speakTo(userId, text, gen, onStart) {
+    this.currentSpeaker = userId;
+    try {
+      await this.speak(text, gen, onStart);
+    } finally {
+      if (this.currentSpeaker === userId) this.currentSpeaker = null;
+    }
+  }
+
+  /** The AI could not answer: say so out loud (once in a while), instead of staying silent. */
+  async sorry(gen) {
+    if (Date.now() - this.lastSorryAt < 30_000 || gen !== this.generation || this.destroyed) return;
+    this.lastSorryAt = Date.now();
+    await this.speak(pickOne(SORRY), gen);
   }
 
   async answer(member, text, gen) {
@@ -363,6 +393,7 @@ export class VoiceSession {
       });
     } catch (err) {
       this.reportError('llm', 'الذكاء الاصطناعي', err);
+      await this.sorry(gen);
       return;
     }
     if (!reply || gen !== this.generation || this.destroyed) return;

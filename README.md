@@ -136,7 +136,9 @@
 | `GEMINI_TTS_MODEL` | `gemini-3.8-flash-tts` | موديل الصوت |
 | `GEMINI_VOICE` | `auto` | `auto` = تصمم صوت إماراتي وتحفظه، أو اسم صوت جاهز مثل `Leda` |
 | `TTS_PROVIDER` / `LLM_PROVIDER` | `gemini` | `groq` = كله على Groq |
-| `TTS_FALLBACK` / `LLM_FALLBACK` | `groq` | `none` = بدون احتياط |
+| `TTS_FALLBACK` | `groq` (أو `azure,groq` إذا فيه مفتاح Azure) | أصوات الاحتياط بالترتيب، `none` = بدون احتياط |
+| `LLM_FALLBACK` | `groq` | `none` = بدون احتياط |
+| `AZURE_SPEECH_KEY` / `AZURE_SPEECH_REGION` | فاضي / `uaenorth` | صوت Azure الإماراتي (فاطمة). عنده حد مجاني شهري، وهو أحسن احتياط لما يخلص حد Gemini وGroq |
 | `GROQ_VOICE_AR` | `noura` | صوت Groq الاحتياطي |
 | `FOLLOWUP_MAX_PEOPLE` | `2` | أكثر من كذا في الروم: ما ترد إلا إذا ناديتها |
 | `BOT_AVATAR_UPDATE` | `false` | `true` = يبدّل صورة البوت بـ `avatar.png` |
