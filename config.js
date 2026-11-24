@@ -81,6 +81,8 @@ export const config = {
   followUpMaxPeople: num('FOLLOWUP_MAX_PEOPLE', 2),
   autoJoinChannelId: env('AUTO_JOIN_CHANNEL_ID'),
   leaveWhenAloneSeconds: num('LEAVE_WHEN_ALONE_SECONDS', 60),
+  // The bot writes in the voice room's text chat only when this is true; otherwise everything goes to the logs.
+  chatMessages: bool('CHAT_MESSAGES', false),
   postTranscripts: bool('POST_TRANSCRIPTS', true),
   avatarUpdate: bool('BOT_AVATAR_UPDATE', false), // put avatar.png on the bot even if it has a picture
   timezone: env('TIMEZONE', 'Asia/Dubai'),

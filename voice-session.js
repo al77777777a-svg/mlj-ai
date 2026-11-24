@@ -384,8 +384,12 @@ export class VoiceSession {
     this.say(`🎙️ دشيت الروم وأسمعكم — ${how}\n-# الصوت يتحول لنص عشان أفهمكم، وما ينحفظ.`);
   }
 
-  /** Post in the voice channel's text chat. */
+  /** Post in the voice channel's text chat (or only write it to the logs, when CHAT_MESSAGES is off). */
   say(content) {
+    if (!config.chatMessages) {
+      log.info(`💬 ${content.replace(/\s*\n\s*/g, ' · ').slice(0, 300)}`);
+      return;
+    }
     this.channel
       .send({ content: content.slice(0, 1900), allowedMentions: { parse: [] } })
       .catch((err) => log.debug('رسالة نصية:', err.message));
