@@ -17,9 +17,9 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * fetch with a 30 s timeout. When the service says "too many requests" (429)
  * and asks to wait only a few seconds, wait and try once more.
  */
-export async function apiRequest(url, init) {
+export async function apiRequest(url, init, timeoutMs = 30_000) {
   for (let attempt = 0; ; attempt++) {
-    const res = await fetch(url, { ...init, signal: AbortSignal.timeout(30_000) });
+    const res = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
     const header = res.headers.get('retry-after');
     const wait = header === null ? NaN : Number(header);
     if (res.status !== 429 || attempt > 0 || !(wait >= 0 && wait <= 8)) return res;

@@ -87,7 +87,7 @@ export const config = {
   debug: bool('DEBUG', false),
 
   // Listening
-  silenceMs: num('SILENCE_MS', 1000), // pause that ends a sentence
+  silenceMs: num('SILENCE_MS', 650), // pause that ends a sentence (shorter = she answers sooner)
   minSpeechMs: num('MIN_SPEECH_MS', 350), // shorter sounds are ignored
   maxSpeechSeconds: num('MAX_SPEECH_SECONDS', 30),
   minVolume: num('MIN_VOLUME', 100), // RMS level below which audio counts as silence
@@ -96,6 +96,7 @@ export const config = {
   llm: {
     provider: llmProvider,
     fallback: backupFor('LLM_FALLBACK', llmProvider),
+    hedgeMs: num('LLM_HEDGE_MS', 1500), // if the main brain is slower than this, the backup starts too and the first answer wins (0 = off)
     gemini: {
       apiKey: geminiKey,
       model: env('GEMINI_CHAT_MODEL', 'gemini-3.8-flash'),

@@ -62,14 +62,39 @@ export async function askAI({ guildId, speaker, text, vars = {}, onNotice }) {
 }
 
 async function createReply(system, messages, onNotice) {
-  const { provider, fallback } = config.llm;
+  const { provider, fallback, hedgeMs } = config.llm;
+  const failed = (error) => {
+    log.warn(`${PROVIDER_NAMES[provider]} ما رد — بيرد ${PROVIDER_NAMES[fallback]} بداله: ${shortError(error)}`);
+    if (rest(`llm:${provider}`, error)) onNotice?.(brainNotice(provider, fallback, error));
+  };
   if (!fallback || !isResting(`llm:${provider}`)) {
+    const main = replyFrom(provider, system, messages);
+    if (!fallback) return main;
+    if (!(hedgeMs > 0)) {
+      try {
+        return await main;
+      } catch (error) {
+        failed(error);
+        return replyFrom(fallback, system, messages);
+      }
+    }
+    // Speed first: if the main brain is slow, the backup starts too and the first answer wins.
+    const early = await Promise.race([
+      main.then((text) => ({ text }), (error) => ({ error })),
+      new Promise((resolve) => setTimeout(resolve, hedgeMs)),
+    ]);
+    if (early && 'text' in early) return early.text;
+    if (early?.error) {
+      failed(early.error);
+      return replyFrom(fallback, system, messages);
+    }
+    log.info(`⏱️ ${PROVIDER_NAMES[provider]} بطيء — شغلت ${PROVIDER_NAMES[fallback]} معه، وأول جواب يربح.`);
+    const backup = replyFrom(fallback, system, messages);
+    main.catch(failed); // a late failure still puts the slow brain to rest
     try {
-      return await replyFrom(provider, system, messages);
-    } catch (error) {
-      if (!fallback) throw error;
-      log.warn(`${PROVIDER_NAMES[provider]} ما رد — بيرد ${PROVIDER_NAMES[fallback]} بداله: ${shortError(error)}`);
-      if (rest(`llm:${provider}`, error)) onNotice?.(brainNotice(provider, fallback, error));
+      return await Promise.any([main, backup]);
+    } catch (errors) {
+      throw errors?.errors?.[0] ?? errors;
     }
   }
   return replyFrom(fallback, system, messages);
@@ -111,11 +136,11 @@ async function geminiReply(system, messages) {
       method: 'POST',
       headers: { 'x-goog-api-key': apiKey, 'Content-Type': 'application/json' },
       body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents, generationConfig }),
-    });
+    }, 10_000);
     if (res.ok) return geminiText(await res.json());
     const error = await apiError(res, 'AI (Gemini)');
     if (res.status === 400 && level && /think/i.test(error.body)) {
-      log.warn(`الموديل ${model} ما يقبل thinkingLevel=${level} — بكمل بدونه.`);
+      log.warn(`الموديل ${model} ما يقبل thinkingLevel=${level} — بجرب مستوى ثاني. (${shortError(error)})`);
       rejectedLevels.add(level);
       continue;
     }
