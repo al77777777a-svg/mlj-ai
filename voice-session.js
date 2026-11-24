@@ -15,14 +15,16 @@ import { escapeMarkdown } from 'discord.js';
 import OpusScript from 'opusscript';
 import { config, log } from './config.js';
 import { askAI } from './llm.js';
-import { activeVoice, synthesize, transcribe, ttsChunkLimit } from './speech.js';
+import { activeVoice, openSpeechStream, synthesize, transcribe, ttsChunkLimit } from './speech.js';
 import {
   DISCORD_CHANNELS,
   DISCORD_RATE,
   cleanForSpeech,
   containsWakeWord,
+  createUpsampler,
   isOnlyWakeWord,
   isStopCommand,
+  liveAudioStream,
   looksLikeNoise,
   pcmDurationMs,
   pcmToWav,
@@ -268,13 +270,31 @@ export class VoiceSession {
       });
     };
     try {
-      prepare(0);
+      // Gemini voice: start talking as soon as the first bit of audio arrives (no waiting for the whole clip).
+      const opening = pieces.length ? openSpeechStream(pieces[0], { onNotice: (notice) => this.say(notice) }).catch(() => null) : null;
+      if (!opening) prepare(0);
       prepare(1);
-      for (let i = 0; i < pieces.length; i++) {
+      const live = opening ? await opening : null;
+      let first = 0;
+      if (live) {
+        first = 1;
+        if (gen !== this.generation || this.destroyed) return live.cancel();
+        log.info(`🔊 الصوت بدا بعد ${((Date.now() - begun) / 1000).toFixed(1)} ثانية (${activeVoice()}، بث مباشر)`);
+        start();
+        const up = createUpsampler(config.tts.louder ? 'auto' : 1);
+        const pcm = (async function* () {
+          for await (const piece of live.chunks) yield up(piece);
+        })();
+        await this.playResource(() =>
+          createAudioResource(liveAudioStream(pcm, live.cancel), { inputType: StreamType.Raw }),
+        );
+        live.cancel();
+      } else if (opening) prepare(0);
+      for (let i = first; i < pieces.length; i++) {
         prepare(i + 2);
         const clip = await clips[i];
         if (!clip || gen !== this.generation || this.destroyed) return;
-        if (i === 0) log.info(`🔊 الصوت جهز بعد ${((Date.now() - begun) / 1000).toFixed(1)} ثانية (${activeVoice()})`);
+        if (i === 0 && !live) log.info(`🔊 الصوت جهز بعد ${((Date.now() - begun) / 1000).toFixed(1)} ثانية (${activeVoice()})`);
         start();
         await this.play(clip);
       }
@@ -288,6 +308,16 @@ export class VoiceSession {
    * (no ffmpeg, so it starts sooner); MP3 goes through ffmpeg.
    */
   play(clip) {
+    return this.playResource(() => {
+      const pcm = wavToDiscordPcm(clip);
+      return pcm
+        ? createAudioResource(Readable.from([pcm]), { inputType: StreamType.Raw })
+        : createAudioResource(Readable.from([clip]), { inputType: StreamType.Arbitrary });
+    });
+  }
+
+  /** Play an audio resource (made by `makeResource`) and wait until it finishes. */
+  playResource(makeResource) {
     return new Promise((resolve) => {
       let settled = false;
       const finish = () => {
@@ -302,11 +332,7 @@ export class VoiceSession {
       this.player.on(AudioPlayerStatus.Idle, finish);
       this.player.on('error', finish);
       try {
-        const pcm = wavToDiscordPcm(clip);
-        const resource = pcm
-          ? createAudioResource(Readable.from([pcm]), { inputType: StreamType.Raw })
-          : createAudioResource(Readable.from([clip]), { inputType: StreamType.Arbitrary });
-        this.player.play(resource);
+        this.player.play(makeResource());
       } catch (err) {
         log.error('تشغيل الصوت:', err.message);
         finish();

@@ -5,7 +5,7 @@
 //   the backup voice (Groq) speaks instead until the main one works again.
 // - apiRequest() / apiError() / rest(): shared helpers (also used by llm.js)
 import { config, log } from './config.js';
-import { joinClips, louder, mostlyLatin, pcmToWav, splitForSpeech } from './helpers.js';
+import { joinClips, louder, mostlyLatin, pcmToWav, readWav, splitForSpeech } from './helpers.js';
 
 export const GEMINI_API = 'https://generativelanguage.googleapis.com/v1beta';
 export const PROVIDER_NAMES = { gemini: 'Gemini', groq: 'Groq', azure: 'Azure', elevenlabs: 'ElevenLabs' };
@@ -277,6 +277,110 @@ function oldSpeechBody(text, voice, style) {
       speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: voice.designed ? READY_VOICE : voice.id } } },
     },
   };
+}
+
+let streamOffUntil = 0;
+
+/**
+ * Speak with Gemini as a live stream: resolves as soon as the FIRST piece of audio arrives
+ * (the rest keeps coming in `chunks`, 24 kHz mono 16-bit PCM). Returns null when streaming
+ * isn't available (so the normal, whole-clip path is used instead).
+ */
+export async function openSpeechStream(text, { onNotice } = {}) {
+  const g = config.tts.gemini;
+  if (!config.tts.stream || config.tts.provider !== 'gemini' || !g.apiKey) return null;
+  if (Date.now() < streamOffUntil || isResting('tts:gemini')) return null;
+  if (text.length <= CACHE_TEXT_MAX && clips.has(`gemini:${text}`)) return null; // already saved: instant
+  const abort = new AbortController();
+  try {
+    const voice = await geminiVoice();
+    const style = g.style || (voice.designed || mostlyLatin(text) ? '' : ACCENT_STYLE);
+    const old = oldRequestFormat || OLD_TTS_MODELS.test(g.model);
+    const res = await apiRequest(
+      `${GEMINI_API}/models/${encodeURIComponent(g.model)}:streamGenerateContent?alt=sse`,
+      {
+        method: 'POST',
+        headers: { 'x-goog-api-key': g.apiKey, 'Content-Type': 'application/json' },
+        body: JSON.stringify(old ? oldSpeechBody(text, voice, style) : speechBody(text, voice, style)),
+        signal: abort.signal,
+      },
+      20_000,
+    );
+    if (!res.ok || !res.body) throw await apiError(res, 'TTS (Gemini stream)');
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    const nextPiece = async () => {
+      for (;;) {
+        const end = buffer.indexOf('\n');
+        if (end < 0) {
+          const { done, value } = await reader.read();
+          if (done) {
+            if (!buffer.trim()) return null;
+            buffer += '\n';
+          } else buffer += decoder.decode(value, { stream: true });
+          continue;
+        }
+        const line = buffer.slice(0, end).trim();
+        buffer = buffer.slice(end + 1);
+        if (!line.startsWith('data:')) continue;
+        let data;
+        try {
+          data = JSON.parse(line.slice(5));
+        } catch {
+          continue;
+        }
+        for (const part of data?.candidates?.[0]?.content?.parts ?? []) {
+          const inline = part.inlineData ?? part.inline_data;
+          if (!inline?.data) continue;
+          let pcm = Buffer.from(inline.data, 'base64');
+          let rate = Number(/rate=(\d+)/.exec(inline.mimeType ?? inline.mime_type ?? '')?.[1]) || 24000;
+          if (pcm.toString('ascii', 0, 4) === 'RIFF') {
+            const wav = readWav(pcm);
+            if (!wav || wav.channels !== 1) throw new Error('TTS (Gemini stream): صيغة صوت مب مدعومة');
+            ({ pcm, rate } = wav);
+          }
+          return { pcm, rate };
+        }
+      }
+    };
+    const first = await nextPiece();
+    if (!first) throw new Error('TTS (Gemini stream): ما رجع صوت');
+    if (first.rate !== 24000) throw new Error(`TTS (Gemini stream): معدل الصوت ${first.rate} مب مدعوم`);
+    async function* chunks() {
+      const all = [first.pcm];
+      let finished = false;
+      try {
+        yield first.pcm;
+        for (let piece = await nextPiece(); piece; piece = await nextPiece()) {
+          all.push(piece.pcm);
+          yield piece.pcm;
+        }
+        finished = true;
+      } catch (error) {
+        if (!abort.signal.aborted) log.warn(`بث صوت Gemini انقطع: ${shortError(error)}`);
+      } finally {
+        abort.abort();
+        // Short phrases ("ها حياتي") are saved so next time they play at once.
+        if (finished && text.length <= CACHE_TEXT_MAX) {
+          remember(`gemini:${text}`, config.tts.louder ? louder(pcmToWav(Buffer.concat(all), 24000, 1)) : pcmToWav(Buffer.concat(all), 24000, 1));
+        }
+      }
+    }
+    return { chunks: chunks(), cancel: () => abort.abort() };
+  } catch (error) {
+    abort.abort();
+    // A limited Gemini: rest it, tell the room, and let the backup voice speak (normal path).
+    // Anything else means streaming doesn't work here, so don't try it again for a while.
+    if (error?.status === 429) {
+      const { fallback } = config.tts;
+      if (fallback && rest('tts:gemini', error)) onNotice?.(voiceNotice('gemini', fallback, error));
+    } else {
+      streamOffUntil = Date.now() + 10 * 60_000;
+      log.warn(`بث الصوت من Gemini ما اشتغل — بستخدم الطريقة العادية: ${shortError(error)}`);
+    }
+    return null;
+  }
 }
 
 /** Gemini answers with base64 audio: a WAV file, or raw 16-bit PCM that needs a WAV header. */

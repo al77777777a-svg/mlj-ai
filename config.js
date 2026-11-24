@@ -133,6 +133,7 @@ export const config = {
     provider: ttsProvider,
     fallback: backupFor('TTS_FALLBACK', ttsProvider),
     louder: bool('VOICE_LOUDER', true), // raise quiet voices to a normal level
+    stream: bool('TTS_STREAM', true), // Gemini voice starts playing while it is still being made
     gemini: {
       apiKey: geminiKey,
       model: env('GEMINI_TTS_MODEL', 'gemini-3.8-flash-tts'),

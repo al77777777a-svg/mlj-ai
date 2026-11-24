@@ -1,3 +1,4 @@
+import { Readable } from 'node:stream';
 // Helpers with no network calls (easy to test):
 // - Arabic text: wake words, stop words, cleaning replies for speech
 // - Audio: PCM conversion and WAV files
@@ -329,4 +330,96 @@ export function joinClips(clips) {
   }
   const anyRiff = clips.some((clip) => clip.toString('ascii', 0, 4) === 'RIFF');
   return anyRiff ? null : Buffer.concat(clips);
+}
+
+/**
+ * Live audio: turns 24 kHz mono 16-bit PCM pieces (as they arrive) into the 48 kHz stereo
+ * Discord wants. One upsampler per voice reply; `gain` makes quiet voices louder (clipped safely).
+ */
+export function createUpsampler(gain = 1, { targetLevel = 4000, maxGain = 3 } = {}) {
+  let previous = null;
+  let carry = null;
+  let chosen = gain === 'auto' ? null : gain;
+  const clamp = (v) => Math.max(-32768, Math.min(32767, Math.round(v)));
+  return (chunk) => {
+    const buf = carry ? Buffer.concat([carry, chunk]) : chunk;
+    const usable = buf.length - (buf.length % 2);
+    carry = usable < buf.length ? buf.subarray(usable) : null;
+    const samples = usable / 2;
+    if (chosen === null && samples) {
+      // Loudness is judged from the first piece of audio and kept for the whole reply.
+      let peak = 0;
+      let sum = 0;
+      for (let i = 0; i < samples; i++) {
+        const v = buf.readInt16LE(i * 2);
+        peak = Math.max(peak, Math.abs(v));
+        sum += v * v;
+      }
+      const level = Math.sqrt(sum / samples);
+      chosen = level && peak ? Math.min(targetLevel / level, (0.95 * 32767) / peak, maxGain) : 1;
+      if (chosen <= 1.05) chosen = 1;
+    }
+    const factor = chosen ?? 1;
+    const out = Buffer.alloc(samples * 8);
+    for (let i = 0; i < samples; i++) {
+      const s = clamp(buf.readInt16LE(i * 2) * factor);
+      const mid = previous === null ? s : clamp((previous + s) / 2);
+      out.writeInt16LE(mid, i * 8);
+      out.writeInt16LE(mid, i * 8 + 2);
+      out.writeInt16LE(s, i * 8 + 4);
+      out.writeInt16LE(s, i * 8 + 6);
+      previous = s;
+    }
+    return out;
+  };
+}
+
+const SILENCE_FRAME = Buffer.alloc(3840); // 20 ms of silence at 48 kHz stereo
+
+/**
+ * A stream Discord can play while the audio is still arriving. If the audio is late, short
+ * silence is played instead of cutting the reply off. `source` is an async iterable of
+ * 48 kHz stereo PCM; `onClose` runs when playing stops (so the download can be cancelled).
+ */
+export function liveAudioStream(source, onClose) {
+  const queue = [];
+  let ended = false;
+  let waiting = false; // the player asked for audio and there was none yet
+  let timer = null;
+  let stream = null;
+  const give = () => {
+    clearTimeout(timer);
+    waiting = false;
+    if (!stream || stream.destroyed) return;
+    if (queue.length) stream.push(queue.shift());
+    else if (ended) stream.push(null);
+    else stream.push(SILENCE_FRAME);
+  };
+  (async () => {
+    try {
+      for await (const piece of source) {
+        queue.push(piece);
+        if (waiting) give();
+      }
+    } catch {
+      // a broken download just ends the audio
+    } finally {
+      ended = true;
+      if (waiting) give();
+    }
+  })();
+  stream = new Readable({
+    highWaterMark: SILENCE_FRAME.length,
+    read() {
+      if (queue.length || ended) return give();
+      waiting = true;
+      timer = setTimeout(give, 20); // no audio yet: play 20 ms of silence (paced like real time)
+    },
+    destroy(error, callback) {
+      clearTimeout(timer);
+      onClose?.();
+      callback(error);
+    },
+  });
+  return stream;
 }
