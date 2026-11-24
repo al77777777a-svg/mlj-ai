@@ -407,7 +407,7 @@ function oldSpeechBody(text, voice, style) {
   };
 }
 
-let streamOffUntil = 0;
+const streamOffUntil = new Map(); // model -> until when live streaming is off for it
 
 /**
  * Speak with Gemini as a live stream: resolves as soon as the FIRST piece of audio arrives
@@ -417,10 +417,21 @@ let streamOffUntil = 0;
 export async function openSpeechStream(text, { onNotice } = {}) {
   const g = config.tts.gemini;
   if (!config.tts.stream || config.tts.provider !== 'gemini' || !g.apiKey) return null;
-  if (Date.now() < streamOffUntil || isResting('tts:gemini')) return null;
-  const model = geminiTtsModels()[0];
-  if (!model) return null;
+  if (isResting('tts:gemini')) return null;
   if (text.length <= CACHE_TEXT_MAX && clips.has(`gemini:${text}`)) return null; // already saved: instant
+  // When one voice model is used up, the next one streams at once (the whole-clip path is seconds slower).
+  for (let tries = 0; tries < 3; tries++) {
+    const model = geminiTtsModels().find((m) => Date.now() >= (streamOffUntil.get(m) ?? 0));
+    if (!model) return null;
+    const { stream, again } = await streamWith(model, text, onNotice);
+    if (stream || !again) return stream;
+  }
+  return null;
+}
+
+/** One live stream from one Gemini voice model. `again` = try the next model's stream. */
+async function streamWith(model, text, onNotice) {
+  const g = config.tts.gemini;
   const abort = new AbortController();
   let style = '';
   try {
@@ -498,23 +509,28 @@ export async function openSpeechStream(text, { onNotice } = {}) {
         }
       }
     }
-    return { chunks: chunks(), cancel: () => abort.abort() };
+    return { stream: { chunks: chunks(), cancel: () => abort.abort() } };
   } catch (error) {
     abort.abort();
-    // A limited Gemini: rest it, tell the room, and let the backup voice speak (normal path).
-    // Anything else means streaming doesn't work here, so don't try it again for a while.
     if ([429, 500, 503].includes(error?.status)) {
-      // This voice model is used up (or busy): the next Gemini voice model speaks; when none is left, the backup voice.
-      if (!restTtsModel(model, error)) {
-        const next = config.tts.fallbacks.find((who) => !isResting(`tts:${who}`)) ?? config.tts.fallbacks[0];
-        if (next && rest('tts:gemini', error)) onNotice?.(voiceNotice('gemini', next, error));
-      }
-    } else if (!refusedStyle(error, style)) {
-      streamOffUntil = Date.now() + 10 * 60_000;
-      log.warn(`بث الصوت من Gemini ما اشتغل — بستخدم الطريقة العادية: ${shortError(error)}`);
+      // This voice model is used up (or busy): the next Gemini voice model streams; when none is left, the backup voice.
+      if (restTtsModel(model, error)) return { again: true };
+      const next = config.tts.fallbacks.find((who) => !isResting(`tts:${who}`)) ?? config.tts.fallbacks[0];
+      if (next && rest('tts:gemini', error)) onNotice?.(voiceNotice('gemini', next, error));
+      return {};
     }
-    return null;
+    if (refusedStyle(error, style)) return { again: true };
+    // Anything else means streaming doesn't work with this model: not again for a while (the next model may stream).
+    streamOffUntil.set(model, Date.now() + 10 * 60_000);
+    log.warn(`بث الصوت من ${model} ما اشتغل — بجرب غيره: ${shortError(error)}`);
+    return { again: true };
   }
+}
+
+/** Get her voice ready at start (finds or designs it once), so the first answer doesn't wait for it. */
+export function prepareVoice() {
+  const usesGemini = config.tts.gemini.apiKey && [config.tts.provider, ...config.tts.fallbacks].includes('gemini');
+  if (usesGemini && config.tts.gemini.voice.toLowerCase() === 'auto') geminiVoice().catch(() => {});
 }
 
 /** Gemini answers with base64 audio: a WAV file, or raw 16-bit PCM that needs a WAV header. */

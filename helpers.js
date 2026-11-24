@@ -91,6 +91,16 @@ export function isStopCommand(text, stopWords, wakeWords) {
   return rest.length > 0 && rest.length <= 4 && rest.every((t) => stop.has(t));
 }
 
+// Words that only ever mean "stop talking" (not "بس"/"خلاص", which also mean "but"/"ok"):
+// with her name (or said to a woman) they stop her even inside a longer sentence ("خلاص فطومي سكت سكت").
+const STRONG_STOP = new Set(['اسكت', 'اسكتي', 'سكت', 'سكتي', 'وقف', 'وقفي', 'كفايه', 'كفى', 'stop', 'shut']);
+
+/** "فطوم سكت" / "خلاص فطومي اسكتي اسكتي" — a strong stop word in a short sentence. */
+export function hasStrongStop(text) {
+  const words = tokens(text);
+  return words.length <= 10 && words.some((t) => STRONG_STOP.has(t));
+}
+
 // Said to a woman ("اسكتي", "وقفي", "بسج"): in this room that is her, even without her name.
 const TO_HER = new Set(['اسكتي', 'سكتي', 'وقفي', 'بسج', 'خلاصج']);
 

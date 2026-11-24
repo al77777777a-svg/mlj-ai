@@ -29,6 +29,7 @@ import {
   isSalam,
   isStopCommand,
   isStopForHer,
+  hasStrongStop,
   isClearQuestion,
   tightenLive,
   joinNames,
@@ -245,7 +246,9 @@ export class VoiceSession {
     if (config.rememberPeople) recordVoice(this.guild.id, { id: member.id, name: member.displayName });
 
     const called = containsWakeWord(text, config.wakeWords);
-    if (isStopCommand(text, config.stopWords, config.wakeWords)) {
+    const stopCommand =
+      isStopCommand(text, config.stopWords, config.wakeWords) || ((called || isStopForHer(text)) && hasStrongStop(text));
+    if (stopCommand) {
       // "بس" / "خلاص" between other people in a big room is not for her: she carries on.
       const forHer = called || isStopForHer(text) || userId === this.currentSpeaker || this.smallRoom();
       if (this.isBusy()) {
@@ -304,7 +307,9 @@ export class VoiceSession {
         return;
       }
     }
-    this.enqueue((gen) => this.answer(member, text, gen, timing));
+    // She starts thinking right away, even if she is still talking: the answer is ready the moment she finishes.
+    const thinking = this.isBusy() ? this.think(member, text) : null;
+    this.enqueue((gen) => this.answer(member, text, gen, timing, thinking));
   }
 
   /** "فطوم روحي روم القهوة": say OK, then join that room. */
@@ -419,7 +424,25 @@ export class VoiceSession {
     await this.speak(pickOne(SORRY), gen);
   }
 
-  async answer(member, text, gen, timing) {
+  /** Ask the brain now; the promise never fails (it carries the error instead). */
+  think(member, text) {
+    const startedAt = Date.now();
+    const promise = askAI({
+      guildId: this.guild.id,
+      speaker: member.displayName,
+      speakerId: member.id,
+      room: this.humans(),
+      text,
+      vars: { SERVER_NAME: this.guild.name, CHANNEL_NAME: this.channel.name },
+      onNotice: (notice) => this.say(notice),
+    }).then(
+      (reply) => ({ reply, doneAt: Date.now() }),
+      (error) => ({ error, doneAt: Date.now() }),
+    );
+    return { startedAt, promise };
+  }
+
+  async answer(member, text, gen, timing, thinking = null) {
     // She was busy so long that the answer would come far too late (and confuse everyone): drop it.
     if (timing && Date.now() - timing.heardAt > config.staleSeconds * 1000) {
       log.info(`⌛ سؤال ${member.displayName} انتظر أكثر من ${config.staleSeconds} ثانية — تركته`);
@@ -427,27 +450,17 @@ export class VoiceSession {
     }
     this.currentSpeaker = member.id;
     try {
-      await this.answerNow(member, text, gen, timing);
+      await this.answerNow(member, text, gen, timing, thinking);
     } finally {
       if (this.currentSpeaker === member.id) this.currentSpeaker = null;
     }
   }
 
-  async answerNow(member, text, gen, timing) {
-    let reply;
-    const askedAt = Date.now();
-    try {
-      reply = await askAI({
-        guildId: this.guild.id,
-        speaker: member.displayName,
-        speakerId: member.id,
-        room: this.humans(),
-        text,
-        vars: { SERVER_NAME: this.guild.name, CHANNEL_NAME: this.channel.name },
-        onNotice: (notice) => this.say(notice),
-      });
-    } catch (err) {
-      this.reportError('llm', 'الذكاء الاصطناعي', err);
+  async answerNow(member, text, gen, timing, thinking = null) {
+    const asked = thinking ?? this.think(member, text);
+    const { reply, error, doneAt } = await asked.promise;
+    if (error) {
+      this.reportError('llm', 'الذكاء الاصطناعي', error);
       await this.sorry(gen);
       return;
     }
@@ -455,7 +468,7 @@ export class VoiceSession {
     log.info(`🤖 ${config.botName}: ${reply}`);
     // The written answer shows up when she starts talking (or right away if the voice fails).
     const transcript = `🗣️ **${escapeMarkdown(member.displayName)}:** ${text}\n🤖 **${escapeMarkdown(config.botName)}:** ${reply}`;
-    const brainMs = Date.now() - askedAt;
+    const brainMs = doneAt - asked.startedAt;
     await this.speak(reply, gen, () => {
       if (timing) {
         const sec = (ms) => (ms / 1000).toFixed(1);

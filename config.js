@@ -163,7 +163,7 @@ export const config = {
   ackReplies: list('ACK_REPLIES', 'ها حياتي,هلا ابوي تفضل,ها عيوني شي؟'),
   // Words that make her stop talking. Said to her (her name, or "اسكتي/وقفي"), by the one she is answering, or in a room of two;
   // "بس" / "خلاص" between other people in a big room doesn't stop her.
-  stopWords: list('STOP_WORDS', 'اسكتي,سكتي,اسكت,وقفي,وقف,خلاص,بس,بسج,كفايه,stop'),
+  stopWords: list('STOP_WORDS', 'اسكتي,سكتي,اسكت,سكت,وقفي,وقف,خلاص,بس,بسج,كفايه,كفى,stop'),
   replyMode: lower('REPLY_MODE', 'name'), // name | everyone
   // Written chat: the channels she chats in (IDs, comma separated; 'none' = no written chat). Needs "Message Content Intent".
   textChannelIds: list('TEXT_CHANNEL_IDS', '1557103411579850852').filter((id) => /^\d{15,25}$/.test(id)),

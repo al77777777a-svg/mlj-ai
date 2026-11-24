@@ -14,6 +14,7 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { generateDependencyReport } from '@discordjs/voice';
 import { ROOT, config, log, validateConfig } from './config.js';
+import { prepareVoice } from './speech.js';
 import { VOICE_PERMISSIONS, VoiceSession, getMode, setMode } from './voice-session.js';
 import { askAI, forgetAll, resetMemory } from './llm.js';
 import { createTextChat, textChatEnabled } from './text-chat.js';
@@ -86,6 +87,7 @@ const commands = [
 
 once(Events.ClientReady, async (ready) => {
   log.info(`✅ ${ready.user.tag} شغال في ${ready.guilds.cache.size} سيرفر`);
+  prepareVoice(); // her voice is ready before anyone talks (no wait on the first answer)
   const invite = ready.generateInvite({
     scopes: [OAuth2Scopes.Bot, OAuth2Scopes.ApplicationsCommands],
     permissions: [
