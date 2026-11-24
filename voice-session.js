@@ -15,7 +15,7 @@ import { escapeMarkdown } from 'discord.js';
 import OpusScript from 'opusscript';
 import { config, log } from './config.js';
 import { askAI } from './llm.js';
-import { synthesize, transcribe, ttsChunkLimit } from './speech.js';
+import { activeVoice, synthesize, transcribe, ttsChunkLimit } from './speech.js';
 import {
   DISCORD_CHANNELS,
   DISCORD_RATE,
@@ -27,12 +27,13 @@ import {
   pcmDurationMs,
   pcmToWav,
   rms,
-  splitForSpeech,
+  splitForFastStart,
   stereo48kToMono16k,
+  wavToDiscordPcm,
 } from './helpers.js';
 
-// Short answers when someone only calls the bot's name.
-const ACKS = ['سم', 'هلا', 'آمر', 'هلا والله'];
+// What the bot says when someone only calls its name (ACK_REPLIES, "ها حياتي" by default).
+const ACKS = config.ackReplies.length ? config.ackReplies : ['هلا'];
 
 // Reply mode per server: 'name' (only when called) or 'everyone'.
 const modes = new Map();
@@ -204,7 +205,8 @@ export class VoiceSession {
     }
 
     const called = containsWakeWord(text, config.wakeWords);
-    const followUp = Date.now() - (this.lastAnswer.get(userId) ?? 0) < config.followUpSeconds * 1000;
+    const followUp =
+      this.smallRoom() && Date.now() - (this.lastAnswer.get(userId) ?? 0) < config.followUpSeconds * 1000;
     // While the bot talks, only react when called by name (avoids echo and cross-talk).
     if (startedWhileTalking && !called) return;
     if (getMode(this.guild.id) === 'name' && !called && !followUp) return;
@@ -227,6 +229,7 @@ export class VoiceSession {
         speaker: member.displayName,
         text,
         vars: { SERVER_NAME: this.guild.name, CHANNEL_NAME: this.channel.name },
+        onNotice: (notice) => this.say(notice),
       });
     } catch (err) {
       this.reportError('llm', 'الذكاء الاصطناعي', err);
@@ -234,37 +237,56 @@ export class VoiceSession {
     }
     if (!reply || gen !== this.generation || this.destroyed) return;
     log.info(`🤖 ${config.botName}: ${reply}`);
-    if (config.postTranscripts) {
-      this.say(
-        `🗣️ **${escapeMarkdown(member.displayName)}:** ${text}\n🤖 **${escapeMarkdown(config.botName)}:** ${reply}`,
-      );
-    }
-    await this.speak(reply, gen);
+    // The written answer shows up when she starts talking (or right away if the voice fails).
+    const transcript = `🗣️ **${escapeMarkdown(member.displayName)}:** ${text}\n🤖 **${escapeMarkdown(config.botName)}:** ${reply}`;
+    await this.speak(reply, gen, () => {
+      if (config.postTranscripts) this.say(transcript);
+    });
     this.lastAnswer.set(member.id, Date.now());
   }
 
-  /** Turn text into speech and play it, piece by piece (next piece is prepared while one plays). */
-  async speak(text, gen = this.generation) {
-    const pieces = splitForSpeech(cleanForSpeech(text), ttsChunkLimit()).slice(0, 15);
+  /**
+   * Turn text into speech and play it, piece by piece (the next piece is prepared while one plays).
+   * `onStart` runs once: when the voice starts, or when it can't.
+   */
+  async speak(text, gen = this.generation, onStart) {
+    let started = false;
+    const start = () => {
+      if (started) return;
+      started = true;
+      onStart?.();
+    };
+    const begun = Date.now();
+    const pieces = splitForFastStart(cleanForSpeech(text), 130, ttsChunkLimit()).slice(0, 15);
     const clips = [];
     const prepare = (i) => {
       if (i >= pieces.length || clips[i]) return;
-      clips[i] = synthesize(pieces[i]).catch((err) => {
+      clips[i] = synthesize(pieces[i], { onNotice: (notice) => this.say(notice) }).catch((err) => {
+        start();
         this.reportError('tts', 'تحويل النص لصوت', err);
         return null;
       });
     };
-    prepare(0);
-    prepare(1);
-    for (let i = 0; i < pieces.length; i++) {
-      prepare(i + 2);
-      const clip = await clips[i];
-      if (!clip || gen !== this.generation || this.destroyed) return;
-      await this.play(clip);
+    try {
+      prepare(0);
+      prepare(1);
+      for (let i = 0; i < pieces.length; i++) {
+        prepare(i + 2);
+        const clip = await clips[i];
+        if (!clip || gen !== this.generation || this.destroyed) return;
+        if (i === 0) log.info(`🔊 الصوت جهز بعد ${((Date.now() - begun) / 1000).toFixed(1)} ثانية (${activeVoice()})`);
+        start();
+        await this.play(clip);
+      }
+    } finally {
+      start();
     }
   }
 
-  /** Play one audio file (WAV/MP3 bytes) and wait until it finishes. */
+  /**
+   * Play one audio clip and wait until it finishes. WAV goes to Discord as raw PCM
+   * (no ffmpeg, so it starts sooner); MP3 goes through ffmpeg.
+   */
   play(clip) {
     return new Promise((resolve) => {
       let settled = false;
@@ -280,7 +302,11 @@ export class VoiceSession {
       this.player.on(AudioPlayerStatus.Idle, finish);
       this.player.on('error', finish);
       try {
-        this.player.play(createAudioResource(Readable.from([clip]), { inputType: StreamType.Arbitrary }));
+        const pcm = wavToDiscordPcm(clip);
+        const resource = pcm
+          ? createAudioResource(Readable.from([pcm]), { inputType: StreamType.Raw })
+          : createAudioResource(Readable.from([clip]), { inputType: StreamType.Arbitrary });
+        this.player.play(resource);
       } catch (err) {
         log.error('تشغيل الصوت:', err.message);
         finish();
@@ -298,6 +324,15 @@ export class VoiceSession {
       .finally(() => {
         this.pending--;
       });
+  }
+
+  /**
+   * In a busy room people chat with each other, so carrying on without the name
+   * would make the bot answer everything (and use up the free limits).
+   */
+  smallRoom() {
+    const people = this.channel.members?.filter?.((member) => !member.user?.bot).size;
+    return people === undefined || people <= config.followUpMaxPeople;
   }
 
   isTalking() {
@@ -330,14 +365,16 @@ export class VoiceSession {
       .catch((err) => log.debug('رسالة نصية:', err.message));
   }
 
-  /** Log an error and show it in the chat (at most once a minute per kind). */
+  /** Log an error and show it in the chat (once a minute per kind; limits every 10 minutes). */
   reportError(kind, label, err) {
     const message = String(err?.message ?? err).replace(/`/g, "'");
     log.error(`${label}:`, message);
-    if (Date.now() - (this.lastErrorAt.get(kind) ?? 0) < 60_000) return;
+    const quietFor = err?.status === 429 ? 10 * 60_000 : 60_000;
+    if (Date.now() - (this.lastErrorAt.get(kind) ?? 0) < quietFor) return;
     this.lastErrorAt.set(kind, Date.now());
     if (err?.status === 429) {
-      this.say(`⏳ وصلنا حد Groq المجاني في ${label} — جربوا بعد شوي، ولو خلص حد اليوم يرجع بكرة.`);
+      const service = /gemini/i.test(message) ? 'Gemini' : 'Groq';
+      this.say(`⏳ وصلنا حد ${service} المجاني في ${label} — جربوا بعد شوي، ولو خلص حد اليوم يرجع بكرة.`);
       return;
     }
     this.say(`⚠️ صار خطأ في ${label}: \`${message.slice(0, 200)}\``);

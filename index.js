@@ -10,8 +10,10 @@ import {
   SlashCommandBuilder,
   escapeMarkdown,
 } from 'discord.js';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
 import { generateDependencyReport } from '@discordjs/voice';
-import { config, log, validateConfig } from './config.js';
+import { ROOT, config, log, validateConfig } from './config.js';
 import { VoiceSession, getMode, setMode } from './voice-session.js';
 import { askAI, resetMemory } from './llm.js';
 
@@ -70,14 +72,48 @@ client.once(Events.ClientReady, async (ready) => {
   log.info(`✅ ${ready.user.tag} شغال في ${ready.guilds.cache.size} سيرفر`);
   const invite = ready.generateInvite({
     scopes: [OAuth2Scopes.Bot, OAuth2Scopes.ApplicationsCommands],
-    permissions: [...VOICE_PERMISSIONS, PermissionFlagsBits.SendMessages, PermissionFlagsBits.UseVAD],
+    permissions: [
+      ...VOICE_PERMISSIONS,
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.UseVAD,
+      PermissionFlagsBits.ChangeNickname,
+    ],
   });
   log.info(`🔗 رابط إضافة البوت لسيرفرك:\n${invite}`);
   await Promise.all(ready.guilds.cache.map(registerCommands));
+  await Promise.all(ready.guilds.cache.map(useBotName));
+  await setAvatar(ready);
   if (config.autoJoinChannelId) await autoJoin();
 });
 
-client.on(Events.GuildCreate, registerCommands);
+client.on(Events.GuildCreate, (guild) => {
+  registerCommands(guild);
+  useBotName(guild);
+});
+
+/** Show the bot as BOT_NAME in each server (its nickname there). */
+async function useBotName(guild) {
+  const me = guild.members.me ?? (await guild.members.fetchMe?.().catch(() => null));
+  if (!me || me.nickname === config.botName) return;
+  try {
+    await me.setNickname(config.botName);
+    log.info(`📛 اسمي في "${guild.name}" صار ${config.botName}`);
+  } catch (err) {
+    log.debug(`ما قدرت أغير اسمي في "${guild.name}": ${err?.message ?? err}`);
+  }
+}
+
+/** Give the bot its face (avatar.png) if it has no picture yet, or once when BOT_AVATAR_UPDATE=true. */
+async function setAvatar(ready) {
+  const file = path.join(ROOT, 'avatar.png');
+  if (!existsSync(file) || (ready.user.avatar && !config.avatarUpdate)) return;
+  try {
+    await ready.user.setAvatar(file);
+    log.info('🖼️ حطيت صورة البوت من avatar.png');
+  } catch (err) {
+    log.warn(`ما قدرت أغير صورة البوت: ${err?.message ?? err}`);
+  }
+}
 
 async function registerCommands(guild) {
   try {
@@ -215,7 +251,7 @@ const handlers = {
 
   async leave(interaction) {
     const session = sessions.get(interaction.guildId);
-    if (!session) return interaction.reply(ephemeral('أنا مو داخل أي روم 🙂'));
+    if (!session) return interaction.reply(ephemeral('أنا مب داخلة أي روم 🙂'));
     session.leftOnPurpose = true;
     session.destroy();
     return interaction.reply('👋 طلعت من الروم.');
@@ -225,14 +261,19 @@ const handlers = {
     const question = interaction.options.getString('question', true);
     const session = sessions.get(interaction.guildId);
     await interaction.deferReply();
+    let notice = '';
     const reply = await askAI({
       guildId: interaction.guildId,
       speaker: interaction.member.displayName,
       text: question,
       vars: { SERVER_NAME: interaction.guild.name, CHANNEL_NAME: session?.channel.name ?? '' },
+      onNotice: (message) => {
+        notice = message;
+      },
     });
+    const answer = `🗣️ **${escapeMarkdown(interaction.member.displayName)}:** ${question}\n🤖 **${escapeMarkdown(config.botName)}:** ${reply || '…'}`;
     await interaction.editReply({
-      content: `🗣️ **${escapeMarkdown(interaction.member.displayName)}:** ${question}\n🤖 **${escapeMarkdown(config.botName)}:** ${reply || '…'}`.slice(0, 2000),
+      content: (notice ? `${answer}\n-# ${notice}` : answer).slice(0, 2000),
       allowedMentions: { parse: [] },
     });
     if (session && reply) session.enqueue((gen) => session.speak(reply, gen));

@@ -1,16 +1,18 @@
-// The bot's brain: a Groq chat model (works on Groq's free plan), with short per-server memory.
+// The bot's brain: Gemini (when GEMINI_API_KEY is set) or a Groq chat model, with short per-server memory.
+// If Gemini can't answer (for example its free limit is used up), Groq answers instead for a while.
 import { config, log } from './config.js';
 import { fillTemplate } from './helpers.js';
-import { apiError, apiRequest } from './speech.js';
+import { GEMINI_API, PROVIDER_NAMES, apiError, apiRequest, isResting, rest, shortError } from './speech.js';
 
-const CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions';
+const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions';
 
 // guildId -> { messages: [{ role, content }], lastUsed }
 const memories = new Map();
 
-// Voice needs speed: ask reasoning models to think briefly and return only the answer.
+// Voice needs speed: ask thinking models to think briefly and return only the answer.
 // If a model rejects these options, stop sending them.
-let sendReasoningOptions = true;
+let sendGroqReasoning = true;
+let sendGeminiThinking = true;
 
 export function resetMemory(guildId) {
   memories.delete(guildId);
@@ -34,17 +36,12 @@ function now() {
   }
 }
 
-function reasoningOptions(model) {
-  if (model.startsWith('openai/gpt-oss')) return { reasoning_effort: 'low', include_reasoning: false };
-  if (model.startsWith('qwen/')) return { reasoning_effort: 'none' };
-  return {};
-}
-
 /**
  * Ask the AI. `speaker` is the Discord display name, `text` what they said.
+ * `onNotice(message)` is called if the backup brain has to step in.
  * Returns the reply text ('' if the AI had nothing to say).
  */
-export async function askAI({ guildId, speaker, text, vars = {} }) {
+export async function askAI({ guildId, speaker, text, vars = {}, onNotice }) {
   const memory = memoryFor(guildId);
   const question = { role: 'user', content: `${speaker}: ${text}` };
   const system = fillTemplate(config.systemPrompt, {
@@ -54,7 +51,7 @@ export async function askAI({ guildId, speaker, text, vars = {} }) {
     ...vars,
   });
 
-  const reply = await createReply([{ role: 'system', content: system }, ...memory.messages, question]);
+  const reply = await createReply(system, [...memory.messages, question], onNotice);
   if (reply) {
     memory.messages.push(question, { role: 'assistant', content: reply });
     const max = Math.max(2, config.llm.memoryTurns * 2);
@@ -64,16 +61,96 @@ export async function askAI({ guildId, speaker, text, vars = {} }) {
   return reply;
 }
 
-async function createReply(messages) {
-  const { apiKey, model, maxTokens } = config.llm;
+async function createReply(system, messages, onNotice) {
+  const { provider, fallback } = config.llm;
+  if (!fallback || !isResting(`llm:${provider}`)) {
+    try {
+      return await replyFrom(provider, system, messages);
+    } catch (error) {
+      if (!fallback) throw error;
+      log.warn(`${PROVIDER_NAMES[provider]} ما رد — بيرد ${PROVIDER_NAMES[fallback]} بداله: ${shortError(error)}`);
+      if (rest(`llm:${provider}`, error)) onNotice?.(brainNotice(provider, fallback, error));
+    }
+  }
+  return replyFrom(fallback, system, messages);
+}
+
+function brainNotice(provider, fallback, error) {
+  const from = PROVIDER_NAMES[provider];
+  const to = PROVIDER_NAMES[fallback];
+  if (error?.status === 429) return `⏳ خلص حد ${from} المجاني للردود — بيرد ${to} لين يتجدد.`;
+  return `⚠️ ${from} ما رد (\`${shortError(error)}\`) — بيرد ${to} بداله.`;
+}
+
+function replyFrom(provider, system, messages) {
+  return provider === 'gemini' ? geminiReply(system, messages) : groqReply(system, messages);
+}
+
+// ---------- Gemini ----------
+function thinkingLevel(model, setting) {
+  if (['minimal', 'low', 'medium', 'high'].includes(setting)) return setting;
+  if (['off', 'none'].includes(setting) || /^gemini-[12]\./.test(model)) return null;
+  // Flash-Lite already thinks very little; Flash thinks "medium" unless told otherwise.
+  // Voice wants the fastest answer, so "minimal" (retried without it if the model refuses).
+  return /lite/.test(model) ? null : 'minimal';
+}
+
+async function geminiReply(system, messages) {
+  const { apiKey, model, thinking, maxTokens } = config.llm.gemini;
+  const contents = messages.map((m) => ({
+    role: m.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: m.content }],
+  }));
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const level = sendGeminiThinking ? thinkingLevel(model, thinking) : null;
+    const generationConfig = { maxOutputTokens: maxTokens };
+    if (level) generationConfig.thinkingConfig = { thinkingLevel: level };
+    const res = await apiRequest(`${GEMINI_API}/models/${encodeURIComponent(model)}:generateContent`, {
+      method: 'POST',
+      headers: { 'x-goog-api-key': apiKey, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ systemInstruction: { parts: [{ text: system }] }, contents, generationConfig }),
+    });
+    if (res.ok) return geminiText(await res.json());
+    const error = await apiError(res, 'AI (Gemini)');
+    if (res.status === 400 && level && /think/i.test(error.body)) {
+      log.warn(`الموديل ${model} ما يقبل thinkingLevel=${level} — بكمل بدونه.`);
+      sendGeminiThinking = false;
+      continue;
+    }
+    throw error;
+  }
+  throw new Error('AI (Gemini) request failed');
+}
+
+function geminiText(data) {
+  const candidate = data?.candidates?.[0];
+  const text = (candidate?.content?.parts ?? [])
+    .filter((part) => !part.thought && typeof part.text === 'string')
+    .map((part) => part.text)
+    .join('');
+  if (!text.trim()) {
+    log.warn(`Gemini رجع رد فاضي (${data?.promptFeedback?.blockReason ?? candidate?.finishReason ?? 'empty'}).`);
+  }
+  return cleanReply(text);
+}
+
+// ---------- Groq ----------
+function reasoningOptions(model) {
+  if (model.startsWith('openai/gpt-oss')) return { reasoning_effort: 'low', include_reasoning: false };
+  if (model.startsWith('qwen/')) return { reasoning_effort: 'none' };
+  return {};
+}
+
+async function groqReply(system, messages) {
+  const { apiKey, model, maxTokens } = config.llm.groq;
   for (let attempt = 0; attempt < 2; attempt++) {
     const body = {
       model,
-      messages,
+      messages: [{ role: 'system', content: system }, ...messages],
       max_completion_tokens: maxTokens,
-      ...(sendReasoningOptions ? reasoningOptions(model) : {}),
+      ...(sendGroqReasoning ? reasoningOptions(model) : {}),
     };
-    const res = await apiRequest(CHAT_URL, {
+    const res = await apiRequest(GROQ_CHAT_URL, {
       method: 'POST',
       headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -82,15 +159,15 @@ async function createReply(messages) {
       const data = await res.json();
       return cleanReply(data?.choices?.[0]?.message?.content);
     }
-    const error = await apiError(res, 'AI');
-    if (res.status === 400 && sendReasoningOptions && /reason/i.test(error.message)) {
+    const error = await apiError(res, 'AI (Groq)');
+    if (res.status === 400 && sendGroqReasoning && /reason/i.test(error.message)) {
       log.warn(`الموديل ${model} ما يقبل إعدادات التفكير — بكمل بدونها.`);
-      sendReasoningOptions = false;
+      sendGroqReasoning = false;
       continue;
     }
     throw error;
   }
-  throw new Error('AI request failed');
+  throw new Error('AI (Groq) request failed');
 }
 
 /** Drop any "thinking" the model may have written into its answer. */

@@ -8,6 +8,7 @@ import { ROOT, config, validateConfig } from './config.js';
 
 const ok = (msg) => console.log(`✅ ${msg}`);
 const bad = (msg) => console.log(`❌ ${msg}`);
+const note = (msg) => console.log(`   ↳ ${msg}`);
 
 const [major, minor] = process.versions.node.split('.').map(Number);
 if (major > 22 || (major === 22 && minor >= 12)) ok(`Node ${process.version}`);
@@ -22,7 +23,12 @@ if (problems.length) {
   for (const problem of problems) bad(problem);
   process.exit(1);
 }
-ok(`الإعدادات كاملة (STT: ${config.stt.provider} / TTS: ${config.tts.provider} / AI: ${config.llm.model})`);
+const { llm, tts } = config;
+const backup = (fallback) => (fallback ? ` (الاحتياط: ${fallback})` : '');
+ok(`الإعدادات كاملة — الاسم: ${config.botName}`);
+note(`السمع: ${config.stt.provider}`);
+note(`العقل: ${llm.provider} / ${llm[llm.provider].model}${backup(llm.fallback)}`);
+note(`الصوت: ${tts.provider}${tts.provider === 'gemini' ? ` / ${tts.gemini.model} / ${tts.gemini.voice}` : ''}${backup(tts.fallback)}`);
 
 console.log('\n--- تجربة المفاتيح ---');
 const { askAI } = await import('./llm.js');
@@ -33,8 +39,9 @@ try {
   const reply = await askAI({
     guildId: 'self-test',
     speaker: 'اختبار',
-    text: 'سلم علي بجملة وحدة قصيرة.',
+    text: 'سلمي علي بجملة وحدة قصيرة.',
     vars: { SERVER_NAME: 'تجربة', CHANNEL_NAME: 'تجربة' },
+    onNotice: note,
   });
   ok(`الذكاء الاصطناعي رد: ${reply}`);
 } catch (err) {
@@ -43,10 +50,11 @@ try {
 }
 
 let audio;
-const isWav = config.tts.provider === 'groq';
-const file = path.join(ROOT, isWav ? 'voice-test.wav' : 'voice-test.mp3');
+let isWav = true;
 try {
-  audio = await synthesize('هلا والله! هذا صوتي، وإن شاء الله يعجبك.');
+  audio = await synthesize('هلا والله! هذا صوتي، وإن شاء الله يعجبك.', { onNotice: note });
+  isWav = audio.toString('ascii', 0, 4) === 'RIFF';
+  const file = path.join(ROOT, isWav ? 'voice-test.wav' : 'voice-test.mp3');
   writeFileSync(file, audio);
   ok(`الصوت اشتغل — اسمعه من الملف: ${file}`);
 } catch (err) {

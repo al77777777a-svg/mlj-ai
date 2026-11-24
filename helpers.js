@@ -151,6 +151,17 @@ export function splitForSpeech(text, maxLen = 200) {
   return chunks;
 }
 
+/**
+ * Like splitForSpeech, but the first piece is short so the voice can start sooner:
+ * the first sentence(s) up to `firstLen`, then the rest in pieces up to `maxLen`.
+ */
+export function splitForFastStart(text, firstLen = 130, maxLen = 400) {
+  const small = splitForSpeech(text, firstLen);
+  if (small.length <= 1) return small;
+  const [first, ...rest] = small;
+  return [first, ...splitForSpeech(rest.join(' '), maxLen)];
+}
+
 /** True when the text is mostly English/Latin letters (pick an English voice). */
 export function mostlyLatin(text) {
   const arabic = (String(text).match(/\p{Script=Arabic}/gu) ?? []).length;
@@ -219,4 +230,103 @@ export function pcmToWav(pcm, rate, channels) {
   header.write('data', 36, 'ascii');
   header.writeUInt32LE(pcm.length, 40);
   return Buffer.concat([header, pcm]);
+}
+
+/** Read a 16-bit PCM WAV file: { rate, channels, pcm }, or null if it is something else. */
+export function readWav(buffer) {
+  if (buffer.length < 12 || buffer.toString('ascii', 0, 4) !== 'RIFF' || buffer.toString('ascii', 8, 12) !== 'WAVE') {
+    return null;
+  }
+  let format = null;
+  let offset = 12;
+  while (offset + 8 <= buffer.length) {
+    const id = buffer.toString('ascii', offset, offset + 4);
+    const size = buffer.readUInt32LE(offset + 4);
+    const start = offset + 8;
+    if (id === 'fmt ' && start + 16 <= buffer.length) {
+      format = {
+        code: buffer.readUInt16LE(start),
+        channels: buffer.readUInt16LE(start + 2),
+        rate: buffer.readUInt32LE(start + 4),
+        bits: buffer.readUInt16LE(start + 14),
+      };
+    } else if (id === 'data') {
+      // 1 = PCM, 0xFFFE = "extensible" PCM
+      if (!format || ![1, 0xfffe].includes(format.code) || format.bits !== 16 || !format.channels) return null;
+      // Streamed WAVs can carry an empty or too-big size: take the bytes that are really there.
+      const end = size === 0 || start + size > buffer.length ? buffer.length : start + size;
+      return { rate: format.rate, channels: format.channels, pcm: buffer.subarray(start, end) };
+    }
+    if (start + size > buffer.length) return null;
+    offset = start + size + (size % 2);
+  }
+  return null;
+}
+
+/**
+ * WAV → raw 48 kHz stereo 16-bit PCM, the format Discord plays directly
+ * (no ffmpeg needed, so the voice starts sooner). null if it isn't a plain WAV.
+ */
+export function wavToDiscordPcm(clip) {
+  const wav = readWav(clip);
+  if (!wav || !wav.rate || wav.channels > 2) return null;
+  const inFrames = Math.floor(wav.pcm.length / (2 * wav.channels));
+  if (!inFrames) return null;
+  const outFrames = Math.floor((inFrames * DISCORD_RATE) / wav.rate);
+  const out = Buffer.alloc(outFrames * 4);
+  const step = wav.rate / DISCORD_RATE;
+  const sample = (frame, ch) => wav.pcm.readInt16LE((frame * wav.channels + Math.min(ch, wav.channels - 1)) * 2);
+  for (let o = 0; o < outFrames; o++) {
+    const pos = o * step;
+    const i = Math.floor(pos);
+    const j = Math.min(i + 1, inFrames - 1);
+    const frac = pos - i;
+    for (let ch = 0; ch < 2; ch++) {
+      out.writeInt16LE(Math.round(sample(i, ch) * (1 - frac) + sample(j, ch) * frac), o * 4 + ch * 2);
+    }
+  }
+  return out;
+}
+
+/**
+ * Make quiet speech louder: raise it towards normal speech loudness without
+ * clipping (at most ×3). Anything that isn't a 16-bit WAV is returned unchanged.
+ */
+export function louder(clip, targetLevel = 4000, maxGain = 3) {
+  const wav = readWav(clip);
+  const samples = wav ? Math.floor(wav.pcm.length / 2) : 0;
+  if (!samples) return clip;
+  let peak = 0;
+  let sum = 0;
+  for (let i = 0; i < samples; i++) {
+    const s = wav.pcm.readInt16LE(i * 2);
+    peak = Math.max(peak, Math.abs(s));
+    sum += s * s;
+  }
+  const level = Math.sqrt(sum / samples);
+  if (!level) return clip;
+  const gain = Math.min(targetLevel / level, (0.95 * 32767) / peak, maxGain);
+  if (gain <= 1.05) return clip;
+  const out = Buffer.alloc(samples * 2);
+  for (let i = 0; i < samples; i++) {
+    const v = Math.round(wav.pcm.readInt16LE(i * 2) * gain);
+    out.writeInt16LE(Math.max(-32768, Math.min(32767, v)), i * 2);
+  }
+  return pcmToWav(out, wav.rate, wav.channels);
+}
+
+/**
+ * Join several audio clips into one: WAV files are merged into one WAV,
+ * MP3 files are put back to back. Returns null if they can't be joined.
+ */
+export function joinClips(clips) {
+  if (clips.length === 1) return clips[0];
+  const wavs = clips.map(readWav);
+  if (wavs.every(Boolean)) {
+    const [first] = wavs;
+    if (!wavs.every((w) => w.rate === first.rate && w.channels === first.channels)) return null;
+    return pcmToWav(Buffer.concat(wavs.map((w) => w.pcm)), first.rate, first.channels);
+  }
+  const anyRiff = clips.some((clip) => clip.toString('ascii', 0, 4) === 'RIFF');
+  return anyRiff ? null : Buffer.concat(clips);
 }
