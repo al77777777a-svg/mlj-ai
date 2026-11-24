@@ -12,7 +12,7 @@ const memories = new Map();
 // Voice needs speed: ask thinking models to think briefly and return only the answer.
 // If a model rejects these options, stop sending them.
 let sendGroqReasoning = true;
-let sendGeminiThinking = true;
+const rejectedLevels = new Set(); // thinking levels this model refused
 
 export function resetMemory(guildId) {
   memories.delete(guildId);
@@ -51,7 +51,7 @@ export async function askAI({ guildId, speaker, text, vars = {}, onNotice }) {
     ...vars,
   });
 
-  const reply = await createReply(system, [...memory.messages, question], onNotice);
+  const reply = stripNamePrefix(await createReply(system, [...memory.messages, question], onNotice), [speaker, config.botName]);
   if (reply) {
     memory.messages.push(question, { role: 'assistant', content: reply });
     const max = Math.max(2, config.llm.memoryTurns * 2);
@@ -88,11 +88,13 @@ function replyFrom(provider, system, messages) {
 
 // ---------- Gemini ----------
 function thinkingLevel(model, setting) {
-  if (['minimal', 'low', 'medium', 'high'].includes(setting)) return setting;
+  if (['minimal', 'low', 'medium', 'high'].includes(setting)) return rejectedLevels.has(setting) ? null : setting;
   if (['off', 'none'].includes(setting) || /^gemini-[12]\./.test(model)) return null;
   // Flash-Lite already thinks very little; Flash thinks "medium" unless told otherwise.
   // Voice wants the fastest answer, so "minimal" (retried without it if the model refuses).
-  return /lite/.test(model) ? null : 'minimal';
+  // Fastest first; if the model refuses a level, the next one is tried.
+  if (/lite/.test(model)) return null;
+  return ['minimal', 'low'].find((level) => !rejectedLevels.has(level)) ?? null;
 }
 
 async function geminiReply(system, messages) {
@@ -101,8 +103,8 @@ async function geminiReply(system, messages) {
     role: m.role === 'assistant' ? 'model' : 'user',
     parts: [{ text: m.content }],
   }));
-  for (let attempt = 0; attempt < 2; attempt++) {
-    const level = sendGeminiThinking ? thinkingLevel(model, thinking) : null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const level = thinkingLevel(model, thinking);
     const generationConfig = { maxOutputTokens: maxTokens };
     if (level) generationConfig.thinkingConfig = { thinkingLevel: level };
     const res = await apiRequest(`${GEMINI_API}/models/${encodeURIComponent(model)}:generateContent`, {
@@ -114,7 +116,7 @@ async function geminiReply(system, messages) {
     const error = await apiError(res, 'AI (Gemini)');
     if (res.status === 400 && level && /think/i.test(error.body)) {
       log.warn(`الموديل ${model} ما يقبل thinkingLevel=${level} — بكمل بدونه.`);
-      sendGeminiThinking = false;
+      rejectedLevels.add(level);
       continue;
     }
     throw error;
@@ -168,6 +170,17 @@ async function groqReply(system, messages) {
     throw error;
   }
   throw new Error('AI (Groq) request failed');
+}
+
+/** The model sometimes copies the "Name: text" format of the question into its answer; drop that. */
+function stripNamePrefix(text, names) {
+  let out = String(text ?? '').trim();
+  for (let i = 0; i < 3; i++) {
+    const hit = names.find((n) => n && out.toLowerCase().startsWith(`${n.toLowerCase()}:`));
+    if (!hit) break;
+    out = out.slice(hit.length + 1).trim();
+  }
+  return out;
 }
 
 /** Drop any "thinking" the model may have written into its answer. */
