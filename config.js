@@ -180,6 +180,16 @@ export const config = {
   followUpMaxPeople: num('FOLLOWUP_MAX_PEOPLE', 2),
   // In a bigger room, the one she just answered can ask one more question without her name within this time.
   followUpBigSeconds: num('FOLLOWUP_BIG_SECONDS', 10),
+  // Gemini Live: she thinks and talks in one fast stream (no separate brain → voice step, no daily voice limit).
+  // If Live can't answer, the usual way (brain + voice) answers.
+  live: {
+    enabled: bool('LIVE_VOICE', true),
+    model: env('LIVE_MODEL', 'gemini-3.8-live'),
+    voice: env('LIVE_VOICE_NAME', 'Zephyr'), // a ready voice (bright), if Live doesn't take her designed voice
+    firstAudioMs: num('LIVE_FIRST_AUDIO_MS', 6000), // no voice by then: the usual way answers instead
+    maxSessionMinutes: num('LIVE_SESSION_MINUTES', 9), // Live sessions end after ~10 minutes: a fresh one before that
+    search: lower('WEB_SEARCH', 'auto') !== 'off', // she can look things up (news, weather) by herself
+  },
   // A question still waiting this long (she was busy) is dropped instead of being answered late.
   staleSeconds: num('STALE_SECONDS', 40),
   // "السلام عليكم": she answers it in any room, once in this time per person.

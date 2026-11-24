@@ -106,6 +106,36 @@ export async function askAI({ guildId, chatKey, medium = 'voice', peer = false, 
   return reply;
 }
 
+// For Gemini Live: she speaks directly (no hidden notes, nothing written).
+const LIVE_NOTE =
+  'انتي تتكلمين بصوتج مباشرة في الروم: ردي بجملة أو جملتين قصار وطبيعيات بلهجتج، بصوت حيوي وسريع، ' +
+  'بدون قوائم ولا رموز ولا إيموجي. الكلام يوصلج مكتوب "الاسم: الكلام" من تحويل صوت لنص (ممكن فيه أخطاء)؛ ' +
+  'لا تبدين ردج باسم الشخص. إذا احتجتي معلومة حديثة (أخبار، طقس، أسعار) دوري عليها.';
+
+/** Her persona and what she knows, for a Gemini Live session (read when the session starts). */
+export function liveInstructions({ guildId, room = [], vars = {} }) {
+  const memory = memoryFor(guildId);
+  const recent = memory.messages
+    .slice(-8)
+    .map((m) => (m.role === 'assistant' ? `${config.botName}: ${m.content}` : m.content))
+    .join('\n');
+  return (
+    fillTemplate(config.systemPrompt, { BOT_NAME: config.botName, TIMEZONE: config.timezone, NOW: now(), ...vars }) +
+    `\n\n${LIVE_NOTE}` +
+    (config.rememberPeople ? `\n\n${memoryBlock(guildId, room, 'live')}` : '') +
+    (recent ? `\n\nآخر السوالف في الروم:\n${recent}` : '')
+  );
+}
+
+/** A Live answer joins the same conversation memory (so the usual way knows what was said if it takes over). */
+export function rememberTurn(guildId, speaker, text, reply) {
+  const memory = memoryFor(guildId);
+  memory.messages.push({ role: 'user', content: `${speaker}: ${text}` }, { role: 'assistant', content: reply });
+  const max = Math.max(2, config.llm.memoryTurns * 2);
+  if (memory.messages.length > max) memory.messages.splice(0, memory.messages.length - max);
+  memory.lastUsed = Date.now();
+}
+
 const label = (name) => PROVIDER_NAMES[name] ?? config.llm.extras[name]?.label ?? name;
 
 async function createReply(system, messages, onNotice, { search = false, slow = false, medium = 'voice' } = {}) {

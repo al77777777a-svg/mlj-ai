@@ -527,6 +527,9 @@ async function streamWith(model, text, onNotice) {
   }
 }
 
+/** Her Gemini voice ({ id, designed }) — Gemini Live speaks with it too when it can. */
+export const geminiVoiceChoice = () => geminiVoice();
+
 /** Get her voice ready at start (finds or designs it once), so the first answer doesn't wait for it. */
 export function prepareVoice() {
   const usesGemini = config.tts.gemini.apiKey && [config.tts.provider, ...config.tts.fallbacks].includes('gemini');

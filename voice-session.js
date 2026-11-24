@@ -14,9 +14,10 @@ import {
 import { ChannelType, PermissionFlagsBits, escapeMarkdown } from 'discord.js';
 import OpusScript from 'opusscript';
 import { config, log } from './config.js';
-import { askAI, pickOption } from './llm.js';
+import { askAI, liveInstructions, pickOption, rememberTurn } from './llm.js';
+import { LiveVoice, liveOn, restLive } from './live.js';
 import { recordVoice } from './people.js';
-import { activeVoice, isResting, openSpeechStream, synthesize, transcribe, ttsChunkLimit } from './speech.js';
+import { activeVoice, isResting, openSpeechStream, shortError, synthesize, transcribe, ttsChunkLimit } from './speech.js';
 import {
   DISCORD_CHANNELS,
   DISCORD_RATE,
@@ -157,6 +158,15 @@ export class VoiceSession {
     this.connected = true;
     connection.subscribe(this.player);
     connection.receiver.speaking.on('start', (userId) => this.listen(userId));
+    // Gemini Live ready before the first question (opening it takes a moment).
+    if (liveOn()) {
+      this.liveVoice()
+        .warm()
+        .catch((error) => {
+          restLive(error);
+          log.warn(`Gemini Live ما اشتغل — برد بالطريقة العادية: ${shortError(error)}`);
+        });
+    }
   }
 
   /** Record one person until they pause, then handle what they said. */
@@ -308,7 +318,8 @@ export class VoiceSession {
       }
     }
     // She starts thinking right away, even if she is still talking: the answer is ready the moment she finishes.
-    const thinking = this.isBusy() ? this.think(member, text) : null;
+    // (With Gemini Live the answer is made while she speaks it, so there is nothing to prepare.)
+    const thinking = this.isBusy() && !liveOn() ? this.think(member, text) : null;
     this.enqueue((gen) => this.answer(member, text, gen, timing, thinking));
   }
 
@@ -456,7 +467,60 @@ export class VoiceSession {
     }
   }
 
+  /** The Gemini Live session of this room (made when first needed). */
+  liveVoice() {
+    this.live ??= new LiveVoice(() =>
+      liveInstructions({
+        guildId: this.guild.id,
+        room: this.humans(),
+        vars: { SERVER_NAME: this.guild.name, CHANNEL_NAME: this.channel.name },
+      }),
+    );
+    return this.live;
+  }
+
+  /**
+   * Answer with Gemini Live: the question goes in as text and her voice streams back while it is made.
+   * Throws (before any sound) if Live can't answer, so the usual way can answer instead.
+   */
+  async answerLive(member, text, gen, timing) {
+    const askedAt = Date.now();
+    const turn = await this.liveVoice().ask(`${member.displayName}: ${text}`);
+    try {
+      await turn.started;
+    } catch (error) {
+      turn.cancel();
+      throw error;
+    }
+    if (gen !== this.generation || this.destroyed) return turn.cancel();
+    const sec = (ms) => (ms / 1000).toFixed(1);
+    log.info(`🔊 الصوت بدا بعد ${sec(Date.now() - askedAt)} ثانية (Gemini Live)`);
+    if (timing) {
+      const total = Date.now() - timing.heardAt;
+      log.info(`⏱️ سمع ${sec(timing.sttMs)}ث · Live ${sec(Date.now() - askedAt)}ث · الكل ${sec(total)}ث (بعد صمتك ${config.silenceMs}م.ث)`);
+    }
+    await this.playLive({ chunks: turn.chunks(), cancel: () => turn.cancel() });
+    const said = await turn.done;
+    if (said) {
+      log.info(`🤖 ${config.botName}: ${said}`);
+      rememberTurn(this.guild.id, member.displayName, text, said);
+      if (config.postTranscripts) {
+        this.say(`🗣️ **${escapeMarkdown(member.displayName)}:** ${text}\n🤖 **${escapeMarkdown(config.botName)}:** ${said}`);
+      }
+    }
+    this.lastAnswer.set(member.id, Date.now());
+  }
+
   async answerNow(member, text, gen, timing, thinking = null) {
+    if (!thinking && liveOn()) {
+      try {
+        return await this.answerLive(member, text, gen, timing);
+      } catch (error) {
+        restLive(error);
+        log.warn(`Gemini Live ما رد — برد بالطريقة العادية: ${shortError(error)}`);
+        if (gen !== this.generation || this.destroyed) return;
+      }
+    }
     const asked = thinking ?? this.think(member, text);
     const { reply, error, doneAt } = await asked.promise;
     if (error) {
@@ -514,16 +578,7 @@ export class VoiceSession {
         if (gen !== this.generation || this.destroyed) return live.cancel();
         log.info(`🔊 الصوت بدا بعد ${((Date.now() - begun) / 1000).toFixed(1)} ثانية (${activeVoice()}، بث مباشر)`);
         start();
-        const up = createUpsampler(config.tts.louder ? 'auto' : 1);
-        const pcm = (async function* () {
-          // heard from the first word, without sleepy pauses
-          const pieces = config.tts.tight ? tightenLive(live.chunks, { maxPauseMs: config.tts.maxPauseMs }) : live.chunks;
-          for await (const piece of pieces) yield up(piece);
-        })();
-        await this.playResource(() =>
-          createAudioResource(liveAudioStream(pcm, live.cancel), { inputType: StreamType.Raw }),
-        );
-        live.cancel();
+        await this.playLive(live);
       } else if (opening) prepare(0);
       for (let i = first; i < pieces.length; i++) {
         prepare(i + 2);
@@ -536,6 +591,18 @@ export class VoiceSession {
     } finally {
       start();
     }
+  }
+
+  /** Play a live voice stream (24 kHz mono PCM pieces) as it arrives, and wait until it ends. */
+  async playLive(live) {
+    const up = createUpsampler(config.tts.louder ? 'auto' : 1);
+    // heard from the first word, without sleepy pauses
+    const pieces = config.tts.tight ? tightenLive(live.chunks, { maxPauseMs: config.tts.maxPauseMs }) : live.chunks;
+    const pcm = (async function* () {
+      for await (const piece of pieces) yield up(piece);
+    })();
+    await this.playResource(() => createAudioResource(liveAudioStream(pcm, live.cancel), { inputType: StreamType.Raw }));
+    live.cancel();
   }
 
   /**
@@ -608,6 +675,7 @@ export class VoiceSession {
   /** Stop talking now and drop answers that are still waiting. */
   stop() {
     this.generation++;
+    this.live?.cancel();
     this.player.stop(true);
   }
 
@@ -658,6 +726,7 @@ export class VoiceSession {
   destroy() {
     if (this.destroyed) return;
     this.destroyed = true;
+    this.live?.close();
     clearTimeout(this.welcomeTimer);
     this.generation++;
     try {
