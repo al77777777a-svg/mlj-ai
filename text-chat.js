@@ -27,6 +27,7 @@ export const textChatEnabled = () => config.textChannelIds.length > 0;
  */
 export function createTextChat(getClient) {
   const answered = new Map(); // `${channelId}:${userId}` -> when she last answered them
+  const followUps = new Map(); // `${channelId}:${userId}` -> answers in a row without being called
   const recent = new Map(); // channelId -> Map(userId -> { name, at })
   const lastUnasked = new Map(); // channelId -> when she last answered without being called
   const botChain = new Map(); // channelId -> how many answers in a row went to a bot (a person writing resets it)
@@ -104,13 +105,20 @@ export function createTextChat(getClient) {
     if (called && (await startWithFriend(message, name, text))) return;
 
     const toSomeoneElse = (others && !mentioned) || repliedToOther;
-    const followUp = !toSomeoneElse && Date.now() - (answered.get(key) ?? 0) < config.textFollowUpSeconds * 1000;
+    // Carrying on without her name: only a question, and only a couple in a row (else she answers every line of a chat).
+    const followUp =
+      !toSomeoneElse &&
+      Date.now() - (answered.get(key) ?? 0) < config.textFollowUpSeconds * 1000 &&
+      looksLikeQuestion(text) &&
+      (followUps.get(key) ?? 0) < config.textFollowUpsInARow;
     let answer = called || followUp;
     if (!answer && !toSomeoneElse) {
       if (config.textReplyMode === 'everyone') answer = true;
-      else if (config.textReplyMode === 'questions') answer = looksLikeQuestion(text);
+      // a question to everyone (3+ words), now and then
+      else if (config.textReplyMode === 'questions') answer = looksLikeQuestion(text) && text.split(/\s+/).length >= 3;
     }
     if (!answer) return;
+    followUps.set(key, called ? 0 : (followUps.get(key) ?? 0) + 1);
     if (!called && !followUp) {
       // Not asked: don't take over the chat.
       if (Date.now() - (lastUnasked.get(message.channelId) ?? 0) < config.textCooldownSeconds * 1000) return;

@@ -5,7 +5,7 @@
 //   the backup voice (Groq) speaks instead until the main one works again.
 // - apiRequest() / apiError() / rest(): shared helpers (also used by llm.js)
 import { config, log } from './config.js';
-import { joinClips, louder, mostlyLatin, pcmToWav, readWav, splitForSpeech } from './helpers.js';
+import { joinClips, louder, mostlyLatin, pcmToWav, readWav, splitForSpeech, tightenSpeech } from './helpers.js';
 
 export const GEMINI_API = 'https://generativelanguage.googleapis.com/v1beta';
 export const PROVIDER_NAMES = { gemini: 'Gemini', groq: 'Groq', azure: 'Azure', elevenlabs: 'ElevenLabs' };
@@ -267,7 +267,13 @@ async function speakAll(provider, text) {
       clip = parts[0];
     }
   }
-  return config.tts.louder ? louder(clip) : clip;
+  return finish(clip);
+}
+
+/** Every clip: without long silences (sounds awake and starts sooner), and not too quiet. */
+function finish(clip) {
+  const tight = config.tts.tight ? tightenSpeech(clip, { maxPauseMs: config.tts.maxPauseMs }) : clip;
+  return config.tts.louder ? louder(tight) : tight;
 }
 
 function speakOnce(provider, text) {
@@ -292,10 +298,28 @@ function speakOnce(provider, text) {
 // Emirati-accent style instead.
 const READY_VOICE = 'Leda'; // youthful female voice
 const ACCENT_STYLE = 'warm, friendly young Emirati woman with a natural UAE accent';
-const DESIGN_NAME = 'emirati-girl-v1';
+const DESIGN_NAME = 'emirati-girl-v2'; // v2: lively and quick (v1 sounded sleepy)
 const OLD_TTS_MODELS = /^gemini-(?:2\.|3\.1-)/; // these use the 2025 request format
 let oldRequestFormat = false;
+let styleRefused = false; // Gemini refused the delivery style once: speak without it
 let designedVoice; // Promise<string | null>
+
+/** How she delivers each line: lively (not sleepy); a ready voice also gets the Emirati accent. */
+function styleFor(voice, english) {
+  if (styleRefused) return '';
+  const g = config.tts.gemini;
+  const energy = /^(none|off|false)$/i.test(g.style ?? '') ? '' : g.style;
+  return [voice.designed || english ? '' : ACCENT_STYLE, energy].filter(Boolean).join(', ');
+}
+
+/** Gemini said no to the style part of the request (not to the voice): speak without it from now on. */
+function refusedStyle(error, style) {
+  // ("Unknown name speech_metadata" is something else: an older Gemini that needs the old request format.)
+  if (!style || styleRefused || error?.status !== 400 || !/\bstyle\b/i.test(`${error.message} ${error.body ?? ''}`)) return false;
+  styleRefused = true;
+  log.warn(`Gemini ما قبل أسلوب الصوت — بيتكلم بدونه: ${shortError(error)}`);
+  return true;
+}
 
 /** Gemini's voice models in order (each has its own free limit); the used-up ones are skipped for a while. */
 function geminiTtsModels() {
@@ -334,7 +358,7 @@ async function geminiSpeechWith(model, text, english) {
   let readyOnly = false; // this backup model doesn't take the designed voice: use the ready one for it
   for (let attempt = 0; attempt < 3; attempt++) {
     const voice = readyOnly ? { id: READY_VOICE, designed: false } : await geminiVoice();
-    const style = g.style || (voice.designed || english ? '' : ACCENT_STYLE);
+    const style = styleFor(voice, english);
     const old = oldRequestFormat || OLD_TTS_MODELS.test(model);
     const res = await apiRequest(`${GEMINI_API}/models/${encodeURIComponent(model)}:generateContent`, {
       method: 'POST',
@@ -344,6 +368,7 @@ async function geminiSpeechWith(model, text, english) {
     if (res.ok) return geminiAudio(await res.json());
 
     const error = await apiError(res, 'TTS (Gemini)');
+    if (refusedStyle(error, style)) continue;
     if (res.status === 400 && voice.designed && /voice/i.test(error.body)) {
       if (model !== g.model) {
         readyOnly = true;
@@ -397,9 +422,10 @@ export async function openSpeechStream(text, { onNotice } = {}) {
   if (!model) return null;
   if (text.length <= CACHE_TEXT_MAX && clips.has(`gemini:${text}`)) return null; // already saved: instant
   const abort = new AbortController();
+  let style = '';
   try {
     const voice = await geminiVoice();
-    const style = g.style || (voice.designed || mostlyLatin(text) ? '' : ACCENT_STYLE);
+    style = styleFor(voice, mostlyLatin(text));
     const old = oldRequestFormat || OLD_TTS_MODELS.test(model);
     const res = await apiRequest(
       `${GEMINI_API}/models/${encodeURIComponent(model)}:streamGenerateContent?alt=sse`,
@@ -468,7 +494,7 @@ export async function openSpeechStream(text, { onNotice } = {}) {
         abort.abort();
         // Short phrases ("ها حياتي") are saved so next time they play at once.
         if (finished && text.length <= CACHE_TEXT_MAX) {
-          remember(`gemini:${text}`, config.tts.louder ? louder(pcmToWav(Buffer.concat(all), 24000, 1)) : pcmToWav(Buffer.concat(all), 24000, 1));
+          remember(`gemini:${text}`, finish(pcmToWav(Buffer.concat(all), 24000, 1)));
         }
       }
     }
@@ -483,7 +509,7 @@ export async function openSpeechStream(text, { onNotice } = {}) {
         const next = config.tts.fallbacks.find((who) => !isResting(`tts:${who}`)) ?? config.tts.fallbacks[0];
         if (next && rest('tts:gemini', error)) onNotice?.(voiceNotice('gemini', next, error));
       }
-    } else {
+    } else if (!refusedStyle(error, style)) {
       streamOffUntil = Date.now() + 10 * 60_000;
       log.warn(`بث الصوت من Gemini ما اشتغل — بستخدم الطريقة العادية: ${shortError(error)}`);
     }
@@ -584,7 +610,9 @@ function azureSpeech(text, english) {
   const lang = voice.split('-').slice(0, 2).join('-');
   const ssml =
     `<speak version="1.0" xmlns="http://www.w3.org/2001/10/synthesis" xml:lang="${lang}">` +
-    `<voice name="${escapeXml(voice)}">${escapeXml(text)}</voice></speak>`;
+    `<voice name="${escapeXml(voice)}">` +
+    (a.rate ? `<prosody rate="${escapeXml(a.rate)}">${escapeXml(text)}</prosody>` : escapeXml(text)) +
+    '</voice></speak>';
   return fetchAudio(`https://${a.region}.tts.speech.microsoft.com/cognitiveservices/v1`, {
     headers: {
       'Ocp-Apim-Subscription-Key': a.apiKey,

@@ -112,6 +112,15 @@ export function looksLikeQuestion(text) {
   return words.length >= 2 && words.slice(0, 2).some((w) => QUESTION_WORDS.has(w));
 }
 
+/**
+ * A clear question, for carrying on without her name in a busy room: a question word near the start.
+ * (A "؟" alone isn't enough: speech-to-text puts one on half-heard noise too.)
+ */
+export function isClearQuestion(text) {
+  const words = tokens(text);
+  return words.length >= 2 && words.slice(0, 3).some((w) => QUESTION_WORDS.has(w));
+}
+
 // ---------- Names, rooms and "does this need fresh info?" ----------
 
 /** A name as it should be read aloud: decorations and emoji removed ("『MLG』 Ali ✨" → "MLG Ali"). */
@@ -251,7 +260,7 @@ export function isRepetitionLoop(text) {
 export function cleanForSpeech(text) {
   return String(text ?? '')
     .replace(/https?:\/\/\S+/g, '')
-    .replace(/\p{Extended_Pictographic}|[\u200D\uFE0F]/gu, '')
+    .replace(/[\p{Extended_Pictographic}\u{1F1E6}-\u{1F1FF}\u{1F3FB}-\u{1F3FF}\u{200D}\u{FE0F}\u{20E3}]/gu, '')
     .replace(/^\s*(?:[-*•]|\d+[.)])\s+/gm, '')
     .replace(/[*_`#>|~[\]{}<>]/g, ' ')
     .replace(/\s*\n+\s*/g, '. ')
@@ -433,6 +442,122 @@ export function wavToDiscordPcm(clip) {
     }
   }
   return out;
+}
+
+/**
+ * Make speech snappier: cut the silence before the first word and after the last one, and shorten long pauses
+ * inside (voices that pause a lot sound sleepy and slow). Anything that isn't a 16-bit WAV is returned unchanged.
+ */
+export function tightenSpeech(clip, { maxPauseMs = 280, leadMs = 40, tailMs = 150 } = {}) {
+  const wav = readWav(clip);
+  if (!wav) return clip;
+  const { rate, channels, pcm } = wav;
+  const frames = Math.floor(pcm.length / (2 * channels));
+  const win = Math.max(1, Math.round(rate / 100)); // 10 ms windows
+  const windows = Math.ceil(frames / win);
+  if (windows < 5) return clip;
+  const peaks = new Float64Array(windows);
+  let top = 0;
+  for (let w = 0; w < windows; w++) {
+    let peak = 0;
+    for (let f = w * win, end = Math.min(frames, f + win); f < end; f++) {
+      for (let ch = 0; ch < channels; ch++) peak = Math.max(peak, Math.abs(pcm.readInt16LE((f * channels + ch) * 2)));
+    }
+    peaks[w] = peak;
+    top = Math.max(top, peak);
+  }
+  // "Quiet" is relative to her loudest bit: words never have gaps this long, real pauses do.
+  const threshold = Math.max(250, top * 0.05);
+  const loud = Array.from(peaks, (p) => p >= threshold);
+  const first = loud.indexOf(true);
+  const last = loud.lastIndexOf(true);
+  if (first < 0) return clip;
+  const maxPause = Math.max(2, Math.round(maxPauseMs / 10));
+  const ranges = []; // [startWindow, endWindow)
+  const keep = (a, b) => {
+    if (b <= a) return;
+    const prev = ranges.at(-1);
+    if (prev && prev[1] === a) prev[1] = b;
+    else ranges.push([a, b]);
+  };
+  // a little air before the first word, and a short natural rest after the last one (sentences don't run together)
+  const begin = Math.max(0, first - Math.round(leadMs / 10));
+  const stop = Math.min(windows, last + 1 + Math.round(tailMs / 10));
+  for (let w = begin; w < stop; ) {
+    if (loud[w]) {
+      keep(w, w + 1);
+      w++;
+      continue;
+    }
+    let r = w;
+    while (r < stop && !loud[r]) r++;
+    if (r - w <= maxPause || r >= stop) keep(w, r);
+    else {
+      // a long pause: keep its start and its end, drop the middle
+      const half = Math.floor(maxPause / 2);
+      keep(w, w + half);
+      keep(r - (maxPause - half), r);
+    }
+    w = r;
+  }
+  const frameBytes = 2 * channels;
+  const fade = Math.max(1, Math.round(rate * 0.004)); // 4 ms crossfade where a pause was cut (no clicks)
+  const parts = ranges.map(([a, b]) => pcm.subarray(a * win * frameBytes, Math.min(frames, b * win) * frameBytes));
+  const out = Buffer.concat(parts);
+  let at = 0;
+  for (let i = 0; i < parts.length - 1; i++) {
+    at += parts[i].length;
+    const n = Math.min(fade, Math.floor(parts[i].length / frameBytes), Math.floor(parts[i + 1].length / frameBytes));
+    for (let k = 0; k < n; k++) {
+      const g = (k + 1) / (n + 1);
+      for (let ch = 0; ch < channels; ch++) {
+        const before = at - (n - k) * frameBytes + ch * 2;
+        const after = at + k * frameBytes + ch * 2;
+        out.writeInt16LE(Math.round(out.readInt16LE(before) * (1 - g)), before);
+        out.writeInt16LE(Math.round(out.readInt16LE(after) * g), after);
+      }
+    }
+  }
+  return out.length < pcm.length ? pcmToWav(out, rate, channels) : clip;
+}
+
+/**
+ * A live voice stream (16-bit mono PCM pieces) made snappier while it plays: the silence before the first word is
+ * skipped (she is heard sooner) and long pauses are cut to `maxPauseMs` (a voice that pauses a lot sounds sleepy).
+ */
+export async function* tightenLive(pieces, { rate = 24000, maxPauseMs = 280, threshold = 400, maxLeadMs = 1500 } = {}) {
+  const win = Math.max(2, Math.round(rate / 100) * 2); // 10 ms, in bytes
+  const lead = []; // the last 30 ms before the first word (kept, so the word isn't clipped)
+  let started = false;
+  let skippedMs = 0;
+  let quietMs = 0;
+  let carry = Buffer.alloc(0); // half a sample left over from the last piece (pieces can split a sample)
+  for await (const raw of pieces) {
+    const piece = carry.length ? Buffer.concat([carry, raw]) : raw;
+    const usable = piece.length - (piece.length % 2);
+    carry = Buffer.from(piece.subarray(usable));
+    const kept = [];
+    for (let at = 0; at < usable; at += win) {
+      const w = piece.subarray(at, Math.min(usable, at + win));
+      let peak = 0;
+      for (let i = 0; i < w.length; i += 2) peak = Math.max(peak, Math.abs(w.readInt16LE(i)));
+      const loud = peak >= threshold;
+      if (!started) {
+        if (loud || skippedMs >= maxLeadMs) {
+          started = true;
+          kept.push(...lead, w);
+        } else {
+          skippedMs += 10;
+          lead.push(w);
+          if (lead.length > 3) lead.shift();
+        }
+        continue;
+      }
+      quietMs = loud ? 0 : quietMs + 10;
+      if (quietMs <= maxPauseMs) kept.push(w);
+    }
+    if (kept.length) yield Buffer.concat(kept);
+  }
 }
 
 /**

@@ -29,7 +29,8 @@ import {
   isSalam,
   isStopCommand,
   isStopForHer,
-  looksLikeQuestion,
+  isClearQuestion,
+  tightenLive,
   joinNames,
   liveAudioStream,
   looksLikeNoise,
@@ -270,7 +271,7 @@ export class VoiceSession {
     const since = Date.now() - (this.lastAnswer.get(userId) ?? 0);
     const followUp = this.smallRoom()
       ? since < config.followUpSeconds * 1000
-      : since < config.followUpBigSeconds * 1000 && looksLikeQuestion(text);
+      : since < config.followUpBigSeconds * 1000 && isClearQuestion(text);
     // While the bot talks, only react when called by name (avoids echo and cross-talk).
     if (startedWhileTalking && !called) return;
     // "السلام عليكم" gets "وعليكم السلام" in any room (once in a while per person).
@@ -502,7 +503,9 @@ export class VoiceSession {
         start();
         const up = createUpsampler(config.tts.louder ? 'auto' : 1);
         const pcm = (async function* () {
-          for await (const piece of live.chunks) yield up(piece);
+          // heard from the first word, without sleepy pauses
+          const pieces = config.tts.tight ? tightenLive(live.chunks, { maxPauseMs: config.tts.maxPauseMs }) : live.chunks;
+          for await (const piece of pieces) yield up(piece);
         })();
         await this.playResource(() =>
           createAudioResource(liveAudioStream(pcm, live.cancel), { inputType: StreamType.Raw }),

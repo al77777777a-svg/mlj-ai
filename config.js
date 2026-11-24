@@ -39,7 +39,10 @@ const DEFAULT_PROMPT = `أنتِ {{BOT_NAME}}، مساعدة ذكاء اصطنا
 
 // How Gemini's designed voice should sound (GEMINI_VOICE=auto).
 const DEFAULT_VOICE_DESIGN =
-  'A young Emirati woman in her early twenties from the United Arab Emirates who speaks natural Emirati Gulf Arabic with an authentic Emirati accent. Warm, friendly and cheerful, with a relaxed conversational pace.';
+  'A young Emirati woman in her early twenties from the United Arab Emirates who speaks natural Emirati Gulf Arabic with an authentic Emirati accent. ' +
+  'Bright, lively and energetic, smiling and playful while she talks, with a brisk, upbeat conversational pace and crisp, clear articulation. Never sleepy, slow or monotone.';
+// How she should deliver every line (Gemini voices): awake and quick, not sleepy.
+const DEFAULT_VOICE_STYLE = 'lively, upbeat and energetic, smiling, with a brisk natural pace — never sleepy or slow';
 
 function loadPrompt() {
   const file = path.resolve(ROOT, env('PROMPT_FILE', 'prompt.txt'));
@@ -132,7 +135,8 @@ const extraNames = Object.keys(extraBrains).filter((name) => {
 // first answer wins; then the other models.
 const VOICE_ORDER = ['gemini', 'groq', 'geminilite', 'groq20b', 'groqqwen', 'mistral', 'geminiflash', 'cerebras', 'openrouter', 'sambanova', 'gemini38', 'custom'];
 // Written chat: other models first, so the voice keeps its limits.
-const TEXT_ORDER = ['geminilite', 'geminiflash', 'groqqwen', 'mistral', 'groq20b', 'openrouter', 'gemini', 'cerebras', 'sambanova', 'groq', 'gemini38', 'custom'];
+// (the strongest Arabic first; OpenRouter's random free models last: they wrote nonsense in the chat)
+const TEXT_ORDER = ['geminilite', 'gemini', 'geminiflash', 'groq', 'groq20b', 'groqqwen', 'mistral', 'cerebras', 'sambanova', 'gemini38', 'openrouter', 'custom'];
 const hasBrain = (name) => (name === 'gemini' ? !!geminiKey : name === 'groq' ? !!groqKey : extraNames.includes(name));
 
 function brainChain(order) {
@@ -164,8 +168,9 @@ export const config = {
   // Written chat: the channels she chats in (IDs, comma separated; 'none' = no written chat). Needs "Message Content Intent".
   textChannelIds: list('TEXT_CHANNEL_IDS', '1557103411579850852').filter((id) => /^\d{15,25}$/.test(id)),
   textReplyMode: lower('TEXT_REPLY_MODE', 'questions'), // name = only when called | questions = also questions | everyone = every message
-  textFollowUpSeconds: num('TEXT_FOLLOWUP_SECONDS', 45), // after she answers someone, their next messages need no name
-  textCooldownSeconds: num('TEXT_COOLDOWN_SECONDS', 15), // minimum gap between answers nobody asked her for
+  textFollowUpSeconds: num('TEXT_FOLLOWUP_SECONDS', 20), // after she answers someone, their next messages need no name
+  textCooldownSeconds: num('TEXT_COOLDOWN_SECONDS', 90), // minimum gap between answers nobody asked her for
+  textFollowUpsInARow: num('TEXT_FOLLOWUPS_IN_A_ROW', 2), // follow-ups without her name before she needs to be called again
   // Bots she chats with (names or IDs): they get an answer only when they talk to her, a few turns in a row at most.
   friendBots: list('FRIEND_BOTS', 'حسون,hassoun'),
   textBotChainMax: num('TEXT_BOT_CHAIN_MAX', 3),
@@ -202,7 +207,7 @@ export const config = {
   debug: bool('DEBUG', false),
 
   // Listening
-  silenceMs: num('SILENCE_MS', 550), // pause that ends a sentence (shorter = she answers sooner)
+  silenceMs: num('SILENCE_MS', 500), // pause that ends a sentence (shorter = she answers sooner)
   minSpeechMs: num('MIN_SPEECH_MS', 350), // shorter sounds are ignored
   maxSpeechSeconds: num('MAX_SPEECH_SECONDS', 30),
   minVolume: num('MIN_VOLUME', 100), // RMS level below which audio counts as silence
@@ -215,7 +220,7 @@ export const config = {
     chain: voiceBrains, // the voice's order
     textChain: textBrains, // the written chat's order
     extras: extraBrains,
-    hedgeMs: num('LLM_HEDGE_MS', 1000), // if the main brain is slower than this, the backup starts too and the first answer wins (0 = off)
+    hedgeMs: num('LLM_HEDGE_MS', 500), // if the main brain is slower than this, the backup starts too and the first answer wins (0 = off)
     // Fresh facts (news, weather, prices...) from Google Search through Gemini: auto = only for questions that need it, always, or off.
     webSearch: lower('WEB_SEARCH', 'auto'),
     searchWords: list('SEARCH_WORDS', ''), // extra words that make her search
@@ -269,6 +274,9 @@ export const config = {
     fallbacks: ttsBackups, // tried in this order when the main voice fails (used-up limit...)
     fallback: ttsBackups[0] ?? '',
     louder: bool('VOICE_LOUDER', true), // raise quiet voices to a normal level
+    // Cut the silence before/after her words and shorten long pauses (voices that pause a lot sound sleepy and slow).
+    tight: bool('VOICE_TIGHT', true),
+    maxPauseMs: num('VOICE_MAX_PAUSE_MS', 280),
     stream: bool('TTS_STREAM', true), // Gemini voice starts playing while it is still being made
     gemini: {
       apiKey: geminiKey,
@@ -281,7 +289,7 @@ export const config = {
       // or a ready voice (Leda, Kore, Aoede, Zephyr, Sulafat…) or a voice ID (voice_…).
       voice: env('GEMINI_VOICE', 'auto'),
       voiceDesign: env('GEMINI_VOICE_DESIGN', DEFAULT_VOICE_DESIGN),
-      style: env('GEMINI_VOICE_STYLE'), // optional, e.g. "cheerful and playful"
+      style: env('GEMINI_VOICE_STYLE', DEFAULT_VOICE_STYLE), // how she delivers each line (none = the voice's own way)
     },
     groq: {
       apiKey: groqKey,
@@ -294,6 +302,7 @@ export const config = {
       apiKey: azureKey,
       region: env('AZURE_SPEECH_REGION', 'uaenorth'),
       voiceAr: env('AZURE_VOICE_AR', 'ar-AE-FatimaNeural'),
+      rate: env('AZURE_RATE', '+10%'), // a bit quicker than the default (sounds awake, not sleepy)
       voiceEn: env('AZURE_VOICE_EN', 'en-US-JennyNeural'),
     },
     elevenlabs: {
