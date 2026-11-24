@@ -71,11 +71,15 @@ function backupsFor(name, provider, fallback) {
 const ttsBackups = backupsFor('TTS_FALLBACK', ttsProvider, env('AZURE_SPEECH_KEY') ? 'azure,groq' : 'groq');
 
 // More brains that speak the OpenAI chat format. Each one joins the backup chain by itself as soon as its key is set.
+const GROQ_CHAT = 'https://api.groq.com/openai/v1/chat/completions';
 const EXTRA_BRAINS = {
+  // Groq counts its free limits per model, so each of these has its own limit (same GROQ_API_KEY, no extra key needed).
+  groq70b: { label: 'Groq Llama 70B', url: GROQ_CHAT, model: 'llama-3.3-70b-versatile', sharesGroqKey: true },
   cerebras: { label: 'Cerebras', url: 'https://api.cerebras.ai/v1/chat/completions', model: 'gpt-oss-120b' },
-  openrouter: { label: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions', model: 'openai/gpt-oss-120b:free' },
+  openrouter: { label: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions', model: 'openrouter/free' },
   mistral: { label: 'Mistral', url: 'https://api.mistral.ai/v1/chat/completions', model: 'mistral-small-latest' },
   sambanova: { label: 'SambaNova', url: 'https://api.sambanova.ai/v1/chat/completions', model: 'Meta-Llama-3.3-70B-Instruct' },
+  groq8b: { label: 'Groq Llama 8B', url: GROQ_CHAT, model: 'llama-3.1-8b-instant', sharesGroqKey: true },
   // Any other OpenAI-compatible service: CUSTOM_LLM_URL (the full .../chat/completions address), CUSTOM_LLM_API_KEY, CUSTOM_LLM_MODEL.
   custom: { label: 'Custom', url: env('CUSTOM_LLM_URL'), model: env('CUSTOM_LLM_MODEL') },
 };
@@ -88,7 +92,7 @@ const extraBrains = Object.fromEntries(
         label: brain.label,
         keyName: name === 'custom' ? 'CUSTOM_LLM_API_KEY' : `${upper}_API_KEY`,
         url: env(`${upper}_CHAT_URL`, brain.url),
-        apiKey: env(name === 'custom' ? 'CUSTOM_LLM_API_KEY' : `${upper}_API_KEY`),
+        apiKey: env(name === 'custom' ? 'CUSTOM_LLM_API_KEY' : `${upper}_API_KEY`) || (brain.sharesGroqKey ? groqKey : ''),
         model: env(name === 'custom' ? 'CUSTOM_LLM_MODEL' : `${upper}_CHAT_MODEL`, brain.model),
         maxTokens: num('EXTRA_MAX_TOKENS', 1024),
       },
@@ -188,11 +192,14 @@ export const config = {
           url: 'https://api.openai.com/v1/audio/transcriptions',
           apiKey: env('OPENAI_API_KEY'),
           model: env('STT_MODEL', 'gpt-transcribe'),
+          fallbackModels: list('STT_FALLBACK_MODELS', ''),
         }
       : {
           url: 'https://api.groq.com/openai/v1/audio/transcriptions',
           apiKey: groqKey,
           model: env('STT_MODEL', 'whisper-large-v3-turbo'),
+          // Groq counts the free limit (20 requests a minute) per model, so a second model doubles it.
+          fallbackModels: list('STT_FALLBACK_MODELS', 'whisper-large-v3'),
         }),
   },
 

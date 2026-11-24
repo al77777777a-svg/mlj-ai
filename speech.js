@@ -17,12 +17,12 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
  * fetch with a 30 s timeout. When the service says "too many requests" (429)
  * and asks to wait only a few seconds, wait and try once more.
  */
-export async function apiRequest(url, init, timeoutMs = 30_000) {
+export async function apiRequest(url, init, timeoutMs = 30_000, { retry429 = true } = {}) {
   for (let attempt = 0; ; attempt++) {
     const res = await fetch(url, { ...init, signal: AbortSignal.timeout(timeoutMs) });
     const header = res.headers.get('retry-after');
     const wait = header === null ? NaN : Number(header);
-    if (res.status !== 429 || attempt > 0 || !(wait >= 0 && wait <= 8)) return res;
+    if (!retry429 || res.status !== 429 || attempt > 0 || !(wait >= 0 && wait <= 8)) return res;
     await sleep(wait * 1000 + 300);
   }
 }
@@ -54,14 +54,22 @@ export function isResting(key) {
   return (restingUntil.get(key) ?? 0) > Date.now();
 }
 
+/** The wait a service asks for ("retry in 3s", "retryDelay": "34s", "try again in 7m12.5s"), in seconds; NaN if none. */
+export function askedWait(details) {
+  const match = /(?:retry(?:Delay"?\s*:\s*"|\s+in\s+)|try again in\s+)(?:(\d+)h)?(?:(\d+)m(?!s))?(?:(\d+(?:\.\d+)?)s)?/i.exec(details);
+  if (!match || !(match[1] || match[2] || match[3])) return NaN;
+  return Number(match[1] ?? 0) * 3600 + Number(match[2] ?? 0) * 60 + Number(match[3] ?? 0);
+}
+
 /** How long (ms) to leave a service alone after this error. */
 export function restTime(error) {
   const status = error?.status;
   const details = `${error?.message ?? ''} ${error?.body ?? ''}`;
   if (status === 429) {
-    if (/per ?day|daily/i.test(details)) return 60 * 60_000; // daily limit: look again in an hour
-    const seconds = Number(/retry(?:Delay"?\s*:\s*"|\s+in\s+)(\d+(?:\.\d+)?)s/i.exec(details)?.[1]);
-    return Math.min(Math.max((seconds || 60) * 1000, 20_000), 30 * 60_000);
+    const seconds = askedWait(details);
+    // A daily limit won't come back soon (unless the service says exactly when, as Groq does).
+    if (/per ?day|daily/i.test(details) && !(seconds >= 60)) return 60 * 60_000;
+    return Math.min(Math.max((seconds || 60) * 1000, 20_000), 60 * 60_000);
   }
   if ([400, 401, 403, 404].includes(status)) return 30 * 60_000; // a settings problem won't fix itself soon
   return 30_000; // busy server, timeout or network hiccup
@@ -80,8 +88,7 @@ export function rest(key, error) {
 }
 
 // ---------- Speech to text ----------
-function buildForm(audio, file, withHints) {
-  const { model } = config.stt;
+function buildForm(audio, file, withHints, model = config.stt.model) {
   const language = config.stt.language.toLowerCase() === 'auto' ? '' : config.stt.language;
   const form = new FormData();
   form.append('file', new Blob([audio], { type: file.type }), file.name);
@@ -109,17 +116,41 @@ function post(form) {
   });
 }
 
-/**
- * Sends audio (a WAV buffer by default) and returns the transcript
- * ('' if nothing was understood).
- */
-export async function transcribe(audio, file = { name: 'speech.wav', type: 'audio/wav' }) {
-  let res = await post(buildForm(audio, file, true));
+/** Sends one transcription request to one model. */
+async function transcribeWith(model, audio, file, hasBackup) {
+  const send = (withHints) =>
+    apiRequest(config.stt.url, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${config.stt.apiKey}` },
+      body: buildForm(audio, file, withHints, model),
+    }, 30_000, { retry429: !hasBackup }); // with a backup model, switch at once instead of waiting
+  let res = await send(true);
   // If the service rejects an optional hint, try once more without hints.
-  if (res.status === 400) res = await post(buildForm(audio, file, false));
+  if (res.status === 400) res = await send(false);
   if (!res.ok) throw await apiError(res, 'STT');
   const data = await res.json();
   return String(data?.text ?? '').trim();
+}
+
+/**
+ * Sends audio (a WAV buffer by default) and returns the transcript ('' if nothing was understood).
+ * If the model hits its limit (Groq: 20 requests a minute per model), the next model takes over.
+ */
+export async function transcribe(audio, file = { name: 'speech.wav', type: 'audio/wav' }) {
+  const models = [config.stt.model, ...(config.stt.fallbackModels ?? [])];
+  const awake = models.filter((model) => !isResting(`stt:${model}`));
+  const order = awake.length ? awake : models.slice(0, 1);
+  let firstError;
+  for (let i = 0; i < order.length; i++) {
+    try {
+      return await transcribeWith(order[i], audio, file, i < order.length - 1);
+    } catch (error) {
+      firstError ??= error;
+      rest(`stt:${order[i]}`, error);
+      log.warn(`STT ${order[i]} ما رد${order[i + 1] ? ` — بيسمع ${order[i + 1]} بداله` : ''}: ${shortError(error)}`);
+    }
+  }
+  throw firstError;
 }
 
 // ---------- Text to speech ----------

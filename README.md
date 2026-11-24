@@ -24,14 +24,14 @@
 | `GROQ_API_KEY` | https://console.groq.com/keys ← Create API Key (مجاني، بدون بطاقة) |
 | `GEMINI_API_KEY` | https://aistudio.google.com/apikey ← Create API key (عقلها وصوتها) |
 | `CEREBRAS_API_KEY` | https://cloud.cerebras.ai (عقل احتياط سريع، مجاني) |
-| `OPENROUTER_API_KEY` | https://openrouter.ai/keys (عقل احتياط، موديلات `:free`) |
+| `OPENROUTER_API_KEY` | https://openrouter.ai/keys (عقل احتياط، الافتراضي `openrouter/free` يختار موديل مجاني شغال) |
 | `MISTRAL_API_KEY` | https://console.mistral.ai (عقل احتياط، مجاني، يحتاج تحقق برقم الجوال) |
 | `SAMBANOVA_API_KEY` | https://cloud.sambanova.ai (عقل احتياط) |
 | `CUSTOM_LLM_URL` / `CUSTOM_LLM_API_KEY` / `CUSTOM_LLM_MODEL` | أي خدمة ثانية بصيغة OpenAI |
 
 بدون `GEMINI_API_KEY` البوت يشتغل كله على Groq (أقل جودة، وحدوده أصغر).
 
-**عقول الاحتياط:** كل مفتاح من (Cerebras, OpenRouter, Mistral, SambaNova, Custom) تحطه في Variables يدخل السلسلة لحاله: Gemini ← Groq ← Cerebras ← OpenRouter ← Mistral ← SambaNova ← Custom. إذا العقل الأول وقف أو خلص حده أو تأخر أكثر من `LLM_HEDGE_MS`، اللي بعده يرد وأول جواب يربح، والمتعطل يرتاح فترة. البحث في Google يشتغل بس مع Gemini.
+**عقول الاحتياط:** كل مفتاح من (Cerebras, OpenRouter, Mistral, SambaNova, Custom) تحطه في Variables يدخل السلسلة لحاله: Gemini ← Groq ← Groq Llama 70B ← Cerebras ← OpenRouter ← Mistral ← SambaNova ← Groq Llama 8B ← Custom (عقلين Llama على Groq يشتغلون بنفس مفتاح Groq بدون مفتاح زيادة، لأن Groq يحسب الحد لكل موديل). إذا العقل الأول وقف أو خلص حده أو تأخر أكثر من `LLM_HEDGE_MS`، اللي بعده يرد وأول جواب يربح، والمتعطل يرتاح فترة. البحث في Google يشتغل بس مع Gemini.
 
 ---
 
@@ -124,7 +124,7 @@
 ## الحدود المجانية (مهم)
 
 - **Gemini** المجاني: عدد طلبات الصوت اليومي صغير. إذا خلص، فطوم تكتب في الشات «خلص حد Gemini المجاني» وتكمل **بصوت Groq** لين يتجدد.
-- **Groq** المجاني: الصوت العربي عنده حد يومي صغير (حوالي 100 طلب)، والتحويل لنص (Whisper) حده 20 طلب بالدقيقة.
+- **Groq** المجاني: الصوت العربي عنده حد يومي صغير (حوالي 100 طلب)، والتحويل لنص (Whisper) حده 20 طلب بالدقيقة لكل موديل، فإذا وصل حده يكمل `whisper-large-v3` تلقائياً (`STT_FALLBACK_MODELS`).
 - تبي صوت إماراتي بدون انقطاع؟ فعّل الدفع في Google AI Studio (رخيص للاستخدام الخفيف) وبيختفي الحد عملياً.
 - خلها ترد بس لما تناديها (`REPLY_MODE=name`) عشان ما تصرف الحد على كلام مو لها.
 
@@ -154,7 +154,7 @@
 | `TTS_PROVIDER` / `LLM_PROVIDER` | `gemini` | `groq` = كله على Groq |
 | `TTS_FALLBACK` | `groq` (أو `azure,groq` إذا فيه مفتاح Azure) | أصوات الاحتياط بالترتيب، `none` = بدون احتياط |
 | `LLM_FALLBACK` | `groq` + كل عقل له مفتاح | عقول الاحتياط بالترتيب (مثلاً `cerebras,groq`)، `none` = بدون احتياط |
-| `CEREBRAS_CHAT_MODEL` / `OPENROUTER_CHAT_MODEL` / `MISTRAL_CHAT_MODEL` / `SAMBANOVA_CHAT_MODEL` | `gpt-oss-120b` / `openai/gpt-oss-120b:free` / `mistral-small-latest` / `Meta-Llama-3.3-70B-Instruct` | موديل كل عقل احتياط |
+| `CEREBRAS_CHAT_MODEL` / `OPENROUTER_CHAT_MODEL` / `MISTRAL_CHAT_MODEL` / `SAMBANOVA_CHAT_MODEL` | `gpt-oss-120b` / `openrouter/free` / `mistral-small-latest` / `Meta-Llama-3.3-70B-Instruct` | موديل كل عقل احتياط |
 | `AZURE_SPEECH_KEY` / `AZURE_SPEECH_REGION` | فاضي / `uaenorth` | صوت Azure الإماراتي (فاطمة). عنده حد مجاني شهري، وهو أحسن احتياط لما يخلص حد Gemini وGroq |
 | `GROQ_VOICE_AR` | `noura` | صوت Groq الاحتياطي |
 | `FOLLOWUP_MAX_PEOPLE` | `2` | أكثر من كذا في الروم: ما ترد إلا إذا ناديتها |
