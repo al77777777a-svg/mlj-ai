@@ -49,13 +49,26 @@ function now() {
   }
 }
 
+// In the written chat, the voice-only rules (very short, no emoji) are relaxed.
+const TEXT_NOTE =
+  'تنبيه مهم: هالمرة الكلام مكتوب في الشات العام (مب صوت)، فبدل اللي انقال فوق عن الصوت: ردي كتابة بلهجتج الإماراتية، ' +
+  'بشكل طبيعي وقصير (جملة إلى ثلاث جمل، وأكثر شوي إذا السؤال يحتاج شرح)، وتقدرين تحطين إيموجي بقلة. ' +
+  'لا تمنشنين أحد، ولا تستخدمين عناوين أو جداول، وإذا في أكثر من واحد يسولف خاطبي اللي كلمج بالاسم.';
+
+// The one writing is another bot (a friend of hers), not a person.
+const PEER_NOTE =
+  'اللي يكلمج الحين مب إنسان، هذا بوت ثاني صديق لج (اسمه قدام كلامه). سولفي معاه بخفة دم وبجملة أو جملتين قصار، ' +
+  'مثل ما يسولفون الربع. لا تطولين ولا تكررين نفس الكلام، ولا تطلبين منه شي مستمر. ولا تحفظين عنه شي في الذاكرة.';
+
 /**
  * Ask the AI. `speaker` is the Discord display name, `text` what they said.
  * `onNotice(message)` is called if the backup brain has to step in.
  * Returns the reply text ('' if the AI had nothing to say).
  */
-export async function askAI({ guildId, speaker, speakerId, room = [], text, vars = {}, onNotice }) {
-  const memory = memoryFor(guildId);
+export async function askAI({ guildId, chatKey, medium = 'voice', peer = false, speaker, speakerId, room = [], text, vars = {}, onNotice }) {
+  // `chatKey`: a separate conversation (the written chat has its own, apart from the voice room); what she
+  // knows about people and the server (people.js) is shared by both, per server.
+  const memory = memoryFor(chatKey ?? guildId);
   const question = { role: 'user', content: `${speaker}: ${text}` };
   // Who is in the room (the speaker always counts) and what is already known about them.
   const here = room.some((p) => p.id === speakerId) || !speakerId ? room : [...room, { id: speakerId, name: speaker }];
@@ -66,7 +79,10 @@ export async function askAI({ guildId, speaker, speakerId, room = [], text, vars
       TIMEZONE: config.timezone,
       NOW: now(),
       ...vars,
-    }) + (config.rememberPeople ? `\n\n${memoryBlock(guildId, people)}` : '');
+    }) +
+    (medium === 'text' ? `\n\n${TEXT_NOTE}` : '') +
+    (peer ? `\n\n${PEER_NOTE}` : '') +
+    (config.rememberPeople && !peer ? `\n\n${memoryBlock(guildId, people, medium)}` : '');
 
   // Fresh facts (news, weather, prices...) come from Google Search; a follow-up like "وبكرة؟" keeps searching for a bit.
   const mode = searchMode();
@@ -79,7 +95,7 @@ export async function askAI({ guildId, speaker, speakerId, room = [], text, vars
   );
   // The hidden memory note never reaches the voice or the chat; it is saved instead.
   const { text: reply, notes } = extractNotes(raw);
-  if (config.rememberPeople && notes.length) saveNotes(guildId, notes, people);
+  if (config.rememberPeople && !peer && notes.length) saveNotes(guildId, notes, people);
   if (reply) {
     memory.messages.push(question, { role: 'assistant', content: reply });
     const max = Math.max(2, config.llm.memoryTurns * 2);

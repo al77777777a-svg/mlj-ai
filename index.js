@@ -16,6 +16,7 @@ import { generateDependencyReport } from '@discordjs/voice';
 import { ROOT, config, log, validateConfig } from './config.js';
 import { VOICE_PERMISSIONS, VoiceSession, getMode, setMode } from './voice-session.js';
 import { askAI, forgetAll, resetMemory } from './llm.js';
+import { createTextChat, textChatEnabled } from './text-chat.js';
 
 const problems = validateConfig();
 if (problems.length) {
@@ -27,7 +28,21 @@ if (problems.length) {
 }
 log.debug(`\n${generateDependencyReport()}`);
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates] });
+// The written chat needs the privileged "Message Content Intent" (Developer Portal → Bot). If it is not switched on,
+// Discord refuses the login: then she starts without the written chat (voice keeps working) and says what to do.
+let client;
+let textOn = textChatEnabled();
+const listeners = [];
+const on = (event, handler) => listeners.push({ event, handler, once: false });
+const once = (event, handler) => listeners.push({ event, handler, once: true });
+function createClient(withText) {
+  const intents = [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates];
+  if (withText) intents.push(GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent);
+  const created = new Client({ intents });
+  for (const listener of listeners) (listener.once ? created.once : created.on).call(created, listener.event, listener.handler);
+  return created;
+}
+const textChat = createTextChat(() => client);
 const sessions = new Map(); // guildId -> VoiceSession
 const aloneTimers = new Map(); // guildId -> timeout
 const ephemeral = (content) => ({ content, flags: MessageFlags.Ephemeral });
@@ -69,13 +84,14 @@ const commands = [
 
 // ---------- Startup ----------
 
-client.once(Events.ClientReady, async (ready) => {
+once(Events.ClientReady, async (ready) => {
   log.info(`✅ ${ready.user.tag} شغال في ${ready.guilds.cache.size} سيرفر`);
   const invite = ready.generateInvite({
     scopes: [OAuth2Scopes.Bot, OAuth2Scopes.ApplicationsCommands],
     permissions: [
       ...VOICE_PERMISSIONS,
       PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.ReadMessageHistory,
       PermissionFlagsBits.UseVAD,
       PermissionFlagsBits.ChangeNickname,
     ],
@@ -84,10 +100,22 @@ client.once(Events.ClientReady, async (ready) => {
   await Promise.all(ready.guilds.cache.map(registerCommands));
   await Promise.all(ready.guilds.cache.map(useBotName));
   await setAvatar(ready);
+  if (textOn) await announceTextChat(ready);
   if (config.autoJoinChannelId) await autoJoin();
 });
 
-client.on(Events.GuildCreate, (guild) => {
+async function announceTextChat(ready) {
+  for (const id of config.textChannelIds) {
+    const channel = await ready.channels.fetch(id).catch(() => null);
+    if (channel?.isTextBased?.()) {
+      log.info(`💬 أسولف كتابة في #${channel.name} (TEXT_REPLY_MODE=${config.textReplyMode})`);
+    } else {
+      log.warn(`💬 ما لقيت الشات ${id} (أو ما أقدر أشوفه) — تأكد من الآيدي ومن صلاحية View Channel.`);
+    }
+  }
+}
+
+on(Events.GuildCreate, (guild) => {
   registerCommands(guild);
   useBotName(guild);
 });
@@ -212,7 +240,7 @@ function checkAlone(session) {
   aloneTimers.set(guildId, timer);
 }
 
-client.on(Events.VoiceStateUpdate, (oldState, newState) => {
+on(Events.VoiceStateUpdate, (oldState, newState) => {
   const guildId = newState.guild.id;
   const session = sessions.get(guildId);
 
@@ -332,7 +360,7 @@ const handlers = {
   },
 };
 
-client.on(Events.InteractionCreate, async (interaction) => {
+on(Events.InteractionCreate, async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (!interaction.inCachedGuild()) {
     await interaction.reply(ephemeral('الأوامر تشتغل داخل السيرفر بس.')).catch(() => {});
@@ -346,6 +374,10 @@ client.on(Events.InteractionCreate, async (interaction) => {
     if (interaction.deferred || interaction.replied) await interaction.editReply(content).catch(() => {});
     else await interaction.reply(ephemeral(content)).catch(() => {});
   }
+});
+
+on(Events.MessageCreate, (message) => {
+  textChat.handle(message).catch((err) => log.error('الشات:', err?.message ?? err));
 });
 
 // ---------- Run ----------
@@ -363,8 +395,25 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
   });
 }
 
-client.login(config.discordToken).catch((err) => {
+function failLogin(err) {
   log.error('ما قدرت أسجل دخول في ديسكورد:', err.message);
   log.error('تأكد إن DISCORD_TOKEN صحيح (Developer Portal → Bot → Reset Token).');
   process.exit(1);
-});
+}
+
+async function start() {
+  client = createClient(textOn);
+  try {
+    await client.login(config.discordToken);
+  } catch (err) {
+    if (!textOn || !(err?.code === 'DisallowedIntents' || /disallowed intents/i.test(err?.message ?? ''))) return failLogin(err);
+    log.warn('💬 الشات الكتابي مطفي: فعّل "Message Content Intent" في https://discord.com/developers/applications ← تطبيقك ← Bot ← Privileged Gateway Intents، وبعدها أعد تشغيل البوت.');
+    log.warn('الصوت يشتغل عادي بدونه.');
+    textOn = false;
+    await Promise.resolve(client.destroy()).catch(() => {});
+    client = createClient(false);
+    await client.login(config.discordToken).catch(failLogin);
+  }
+}
+
+start();

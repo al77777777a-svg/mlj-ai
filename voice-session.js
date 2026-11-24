@@ -15,6 +15,7 @@ import { ChannelType, PermissionFlagsBits, escapeMarkdown } from 'discord.js';
 import OpusScript from 'opusscript';
 import { config, log } from './config.js';
 import { askAI, pickOption } from './llm.js';
+import { recordVoice } from './people.js';
 import { activeVoice, isResting, openSpeechStream, synthesize, transcribe, ttsChunkLimit } from './speech.js';
 import {
   DISCORD_CHANNELS,
@@ -25,6 +26,7 @@ import {
   findVoiceChannel,
   isOnlyWakeWord,
   isRepetitionLoop,
+  isSalam,
   isStopCommand,
   joinNames,
   liveAudioStream,
@@ -48,6 +50,8 @@ const NOT_FOUND = ['ما لقيت روم بهذا الاسم، عيدها لي',
 const SORRY = ['ما قدرت أجاوبك الحين، عيدها بعد شوي', 'تعبت شوي، عيد علي بعد لحظة'];
 const SAME_ROOM = ['أنا موجودة في نفس الروم!', 'أنا هنا في نفس الروم يالغالي'];
 const NO_ACCESS = ['ما أقدر أدخل ذاك الروم، ما عندي صلاحية'];
+// "السلام عليكم" gets one of these straight away, without the AI (short and fixed, so the voice is kept ready after the first time).
+const SALAM_REPLIES = ['وعليكم السلام ورحمة الله وبركاته', 'وعليكم السلام، هلا والله', 'هلا والله، وعليكم السلام'];
 
 // What the bot says when someone only calls its name (ACK_REPLIES, "ها حياتي" by default).
 const ACKS = config.ackReplies.length ? config.ackReplies : ['هلا'];
@@ -222,6 +226,7 @@ export class VoiceSession {
       this.guild.members.cache.get(userId) ?? (await this.guild.members.fetch(userId).catch(() => null));
     if (!member || member.user.bot) return;
 
+    const heardAt = Date.now(); // the moment her ears had the whole sentence (after the short pause)
     let text;
     try {
       text = await transcribe(pcmToWav(stereo48kToMono16k(pcm), 16000, 1));
@@ -230,7 +235,9 @@ export class VoiceSession {
       return;
     }
     if (!text || looksLikeNoise(text) || this.destroyed) return;
+    const timing = { heardAt, sttMs: Date.now() - heardAt };
     log.info(`🗣️  ${member.displayName}: ${text}`);
+    if (config.rememberPeople) recordVoice(this.guild.id, { id: member.id, name: member.displayName });
 
     if (isStopCommand(text, config.stopWords, config.wakeWords)) {
       if (this.isBusy()) {
@@ -247,15 +254,28 @@ export class VoiceSession {
     }
 
     const called = containsWakeWord(text, config.wakeWords);
+    const salam = isSalam(text, config.wakeWords);
     const followUp =
       this.smallRoom() && Date.now() - (this.lastAnswer.get(userId) ?? 0) < config.followUpSeconds * 1000;
     // While the bot talks, only react when called by name (avoids echo and cross-talk).
     if (startedWhileTalking && !called) return;
-    if (getMode(this.guild.id) === 'name' && !called && !followUp) return;
+    // Someone alone with her who says "السلام عليكم" is talking to her, even without her name.
+    const greeting = salam && this.humans().length <= 1;
+    if (getMode(this.guild.id) === 'name' && !called && !followUp && !greeting) {
+      log.info(`🙈 ما ذكر اسمي (${config.botName}) — تجاهلته`);
+      return;
+    }
 
     if (isOnlyWakeWord(text, config.wakeWords)) {
       this.enqueue(async (gen) => {
         await this.speakTo(userId, pickOne(ACKS), gen);
+        this.lastAnswer.set(userId, Date.now());
+      });
+      return;
+    }
+    if (salam) {
+      this.enqueue(async (gen) => {
+        await this.speakTo(userId, pickOne(SALAM_REPLIES), gen);
         this.lastAnswer.set(userId, Date.now());
       });
       return;
@@ -267,7 +287,7 @@ export class VoiceSession {
         return;
       }
     }
-    this.enqueue((gen) => this.answer(member, text, gen));
+    this.enqueue((gen) => this.answer(member, text, gen, timing));
   }
 
   /** "فطوم روحي روم القهوة": say OK, then join that room. */
@@ -340,7 +360,11 @@ export class VoiceSession {
         .replace(/\s{2,}/g, ' ')
         .trim();
       log.info(`👋 رحبت بـ ${names || 'اللي دخل'}`);
-      this.enqueue((gen) => this.speak(text, gen));
+      this.enqueue(async (gen) => {
+        await this.speak(text, gen);
+        // They can answer her hello without saying her name.
+        for (const [id] of waiting) this.lastAnswer.set(id, Date.now());
+      });
     }, config.welcomeDelayMs);
   }
 
@@ -370,17 +394,18 @@ export class VoiceSession {
     await this.speak(pickOne(SORRY), gen);
   }
 
-  async answer(member, text, gen) {
+  async answer(member, text, gen, timing) {
     this.currentSpeaker = member.id;
     try {
-      await this.answerNow(member, text, gen);
+      await this.answerNow(member, text, gen, timing);
     } finally {
       if (this.currentSpeaker === member.id) this.currentSpeaker = null;
     }
   }
 
-  async answerNow(member, text, gen) {
+  async answerNow(member, text, gen, timing) {
     let reply;
+    const askedAt = Date.now();
     try {
       reply = await askAI({
         guildId: this.guild.id,
@@ -400,7 +425,13 @@ export class VoiceSession {
     log.info(`🤖 ${config.botName}: ${reply}`);
     // The written answer shows up when she starts talking (or right away if the voice fails).
     const transcript = `🗣️ **${escapeMarkdown(member.displayName)}:** ${text}\n🤖 **${escapeMarkdown(config.botName)}:** ${reply}`;
+    const brainMs = Date.now() - askedAt;
     await this.speak(reply, gen, () => {
+      if (timing) {
+        const sec = (ms) => (ms / 1000).toFixed(1);
+        const total = Date.now() - timing.heardAt;
+        log.info(`⏱️ سمع ${sec(timing.sttMs)}ث · فكر ${sec(brainMs)}ث · الصوت ${sec(total - timing.sttMs - brainMs)}ث · الكل ${sec(total)}ث (بعد صمتك ${config.silenceMs}م.ث)`);
+      }
       if (config.postTranscripts) this.say(transcript);
     });
     this.lastAnswer.set(member.id, Date.now());

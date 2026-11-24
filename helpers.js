@@ -65,11 +65,32 @@ export function isOnlyWakeWord(text, wakeWords) {
   return containsWakeWord(text, wakeWords) && withoutWakeWords(text, wakeWords).length === 0;
 }
 
+const SALAM_WORDS = new Set(['سلام', 'السلام', 'عليكم', 'ورحمه', 'الله', 'وبركاته']);
+
+/** "السلام عليكم" (with or without "ورحمة الله وبركاته" and her name). "وعليكم السلام" is an answer, not a greeting. */
+export function isSalam(text, wakeWords = []) {
+  const rest = withoutWakeWords(text, wakeWords);
+  return rest.includes('عليكم') && rest.some((t) => t === 'سلام' || t === 'السلام') && rest.every((t) => SALAM_WORDS.has(t));
+}
+
 /** "اسكت" / "خلاص" / "كلود وقف" ... — every remaining word is a stop word. */
 export function isStopCommand(text, stopWords, wakeWords) {
   const stop = new Set(stopWords.flatMap(tokens));
   const rest = withoutWakeWords(text, wakeWords);
   return rest.length > 0 && rest.length <= 4 && rest.every((t) => stop.has(t));
+}
+
+// ---------- Written chat ----------
+
+const QUESTION_WORDS = new Set(['شو', 'وش', 'ايش', 'اش', 'شنو', 'ليش', 'لييش', 'لماذا', 'ماذا', 'كيف', 'وين', 'فين', 'متى', 'منو', 'من', 'مين', 'كم', 'هل', 'ويش', 'شلون', 'علام', 'اي', 'أي', 'ايه', 'ايهم']);
+
+/** Does this message ask something? A question mark, or a question word at the start ("شو الطقس"). */
+export function looksLikeQuestion(text) {
+  const raw = String(text ?? '').trim();
+  if (!raw) return false;
+  if (/[?؟]/.test(raw)) return true;
+  const words = tokens(raw);
+  return words.length >= 2 && words.slice(0, 2).some((w) => QUESTION_WORDS.has(w));
 }
 
 // ---------- Names, rooms and "does this need fresh info?" ----------

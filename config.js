@@ -112,6 +112,15 @@ export const config = {
   ackReplies: list('ACK_REPLIES', 'ها حياتي,هلا ابوي تفضل,ها عيوني شي؟'),
   stopWords: list('STOP_WORDS', 'اسكت,خلاص,بس,وقف,كفايه,stop'),
   replyMode: lower('REPLY_MODE', 'name'), // name | everyone
+  // Written chat: the channels she chats in (IDs, comma separated; 'none' = no written chat). Needs "Message Content Intent".
+  textChannelIds: list('TEXT_CHANNEL_IDS', '1557103411579850852').filter((id) => /^\d{15,25}$/.test(id)),
+  textReplyMode: lower('TEXT_REPLY_MODE', 'questions'), // name = only when called | questions = also questions | everyone = every message
+  textFollowUpSeconds: num('TEXT_FOLLOWUP_SECONDS', 45), // after she answers someone, their next messages need no name
+  textCooldownSeconds: num('TEXT_COOLDOWN_SECONDS', 8), // minimum gap between answers nobody asked her for
+  // Bots she chats with (names or IDs): they get an answer only when they talk to her, a few turns in a row at most.
+  friendBots: list('FRIEND_BOTS', 'حسون,hassoun'),
+  textBotChainMax: num('TEXT_BOT_CHAIN_MAX', 3),
+  textBotCooldownSeconds: num('TEXT_BOT_COOLDOWN_SECONDS', 6),
   followUpSeconds: num('FOLLOWUP_SECONDS', 15),
   // Talking on without the name only works when the room has at most this many people.
   followUpMaxPeople: num('FOLLOWUP_MAX_PEOPLE', 2),
@@ -120,6 +129,7 @@ export const config = {
   // The bot writes in the voice room's text chat only when this is true; otherwise everything goes to the logs.
   dataDir: path.resolve(ROOT, env('DATA_DIR', 'data')), // where what she remembers is saved
   rememberPeople: bool('REMEMBER_PEOPLE', true), // remember people / the server between conversations
+  quietDays: num('QUIET_DAYS', 3), // someone not seen for this many days counts as "gone quiet"
   chatMessages: bool('CHAT_MESSAGES', false),
   postTranscripts: bool('POST_TRANSCRIPTS', true),
   // Say hello by name when someone comes into the room.
@@ -137,7 +147,7 @@ export const config = {
   debug: bool('DEBUG', false),
 
   // Listening
-  silenceMs: num('SILENCE_MS', 650), // pause that ends a sentence (shorter = she answers sooner)
+  silenceMs: num('SILENCE_MS', 550), // pause that ends a sentence (shorter = she answers sooner)
   minSpeechMs: num('MIN_SPEECH_MS', 350), // shorter sounds are ignored
   maxSpeechSeconds: num('MAX_SPEECH_SECONDS', 30),
   minVolume: num('MIN_VOLUME', 100), // RMS level below which audio counts as silence
@@ -149,7 +159,7 @@ export const config = {
     fallback: llmBackups[0] ?? '',
     chain: [llmProvider, ...llmBackups],
     extras: extraBrains,
-    hedgeMs: num('LLM_HEDGE_MS', 1500), // if the main brain is slower than this, the backup starts too and the first answer wins (0 = off)
+    hedgeMs: num('LLM_HEDGE_MS', 1000), // if the main brain is slower than this, the backup starts too and the first answer wins (0 = off)
     // Fresh facts (news, weather, prices...) from Google Search through Gemini: auto = only for questions that need it, always, or off.
     webSearch: lower('WEB_SEARCH', 'auto'),
     searchWords: list('SEARCH_WORDS', ''), // extra words that make her search
@@ -235,6 +245,9 @@ export function validateConfig() {
 
   need(config.discordToken, 'DISCORD_TOKEN فاضي — حط توكن البوت من Discord Developer Portal.');
 
+  if (!['name', 'questions', 'everyone'].includes(config.textReplyMode)) {
+    problems.push('TEXT_REPLY_MODE لازم يكون name أو questions أو everyone.');
+  }
   if (!['name', 'everyone'].includes(config.replyMode)) {
     problems.push('REPLY_MODE لازم يكون name أو everyone.');
   }
