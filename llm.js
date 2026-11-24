@@ -1,5 +1,6 @@
 // The bot's brain: Gemini (when GEMINI_API_KEY is set) or a Groq chat model, with short per-server memory.
-// If Gemini can't answer (for example its free limit is used up), Groq answers instead for a while.
+// If the main brain can't answer (for example its free limit is used up), the next one in the chain answers
+// instead for a while: Groq, then any extra brain whose key is set (Cerebras, OpenRouter, Mistral, SambaNova, custom).
 import { config, log } from './config.js';
 import { fillTemplate, wantsFreshInfo } from './helpers.js';
 import { extractNotes, forgetAll, memoryBlock, saveNotes } from './people.js';
@@ -26,7 +27,7 @@ export { forgetAll };
 /** WEB_SEARCH=auto|always|off. Only Gemini can search, so any other brain means off. */
 function searchMode() {
   const mode = config.llm.webSearch;
-  if (['off', 'false', 'no', 'none'].includes(mode) || config.llm.provider !== 'gemini') return 'off';
+  if (['off', 'false', 'no', 'none'].includes(mode) || !config.llm.chain.includes('gemini')) return 'off';
   return mode === 'always' ? 'always' : 'auto';
 }
 
@@ -88,57 +89,81 @@ export async function askAI({ guildId, speaker, speakerId, room = [], text, vars
   return reply;
 }
 
+const label = (name) => PROVIDER_NAMES[name] ?? config.llm.extras[name]?.label ?? name;
+
 async function createReply(system, messages, onNotice, { search = false, slow = false } = {}) {
-  const { provider, fallback } = config.llm;
-  // A search takes longer, and the backup brain can't search, so it waits longer before joining in.
+  // A search takes longer, and the other brains can't search, so they wait longer before joining in.
   const hedgeMs = slow ? config.llm.searchHedgeMs : config.llm.hedgeMs;
   const options = { search };
-  const failed = (error) => {
-    log.warn(`${PROVIDER_NAMES[provider]} ما رد — بيرد ${PROVIDER_NAMES[fallback]} بداله: ${shortError(error)}`);
-    if (rest(`llm:${provider}`, error)) onNotice?.(brainNotice(provider, fallback, error));
-  };
-  if (!fallback || !isResting(`llm:${provider}`)) {
-    const main = replyFrom(provider, system, messages, options);
-    if (!fallback) return main;
-    if (!(hedgeMs > 0)) {
-      try {
-        return await main;
-      } catch (error) {
-        failed(error);
-        return replyFrom(fallback, system, messages, options);
+  // Brains that are resting (a used-up limit...) are skipped; if all of them rest, try them all anyway.
+  const awake = config.llm.chain.filter((name) => !isResting(`llm:${name}`));
+  const order = awake.length ? awake : config.llm.chain;
+  return raceChain(
+    order,
+    (name) => replyFrom(name, system, messages, options),
+    hedgeMs,
+    (name, error, next) => {
+      log.warn(`${label(name)} ما رد${next ? ` — بيرد ${label(next)} بداله` : ''}: ${shortError(error)}`);
+      if (rest(`llm:${name}`, error) && next) onNotice?.(brainNotice(name, next, error));
+    },
+  );
+}
+
+/**
+ * Ask the brains in order. The first one starts alone; the next one starts when the one before it fails,
+ * or when it is slower than `hedgeMs` (then both run and the first answer wins).
+ */
+function raceChain(order, run, hedgeMs, onFail) {
+  return new Promise((resolve, reject) => {
+    const errors = [];
+    let next = 0;
+    let pending = 0;
+    let finished = false;
+    let timer;
+    const finish = (settle, value) => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      settle(value);
+    };
+    const launch = () => {
+      if (finished || next >= order.length) return false;
+      const name = order[next++];
+      pending++;
+      run(name).then(
+        (text) => finish(resolve, text),
+        (error) => {
+          pending--;
+          errors.push(error);
+          onFail(name, error, order[next]);
+          if (!finished && !launch() && pending === 0) finish(reject, errors[0]);
+        },
+      );
+      clearTimeout(timer);
+      if (hedgeMs > 0 && next < order.length) {
+        timer = setTimeout(() => {
+          if (finished || next >= order.length) return;
+          log.info(`⏱️ ${label(order[next - 1])} بطيء — شغلت ${label(order[next])} معه، وأول جواب يربح.`);
+          launch();
+        }, hedgeMs);
       }
-    }
-    // Speed first: if the main brain is slow, the backup starts too and the first answer wins.
-    const early = await Promise.race([
-      main.then((text) => ({ text }), (error) => ({ error })),
-      new Promise((resolve) => setTimeout(resolve, hedgeMs)),
-    ]);
-    if (early && 'text' in early) return early.text;
-    if (early?.error) {
-      failed(early.error);
-      return replyFrom(fallback, system, messages, options);
-    }
-    log.info(`⏱️ ${PROVIDER_NAMES[provider]} بطيء — شغلت ${PROVIDER_NAMES[fallback]} معه، وأول جواب يربح.`);
-    const backup = replyFrom(fallback, system, messages, options);
-    main.catch(failed); // a late failure still puts the slow brain to rest
-    try {
-      return await Promise.any([main, backup]);
-    } catch (errors) {
-      throw errors?.errors?.[0] ?? errors;
-    }
-  }
-  return replyFrom(fallback, system, messages, options);
+      return true;
+    };
+    launch();
+  });
 }
 
 function brainNotice(provider, fallback, error) {
-  const from = PROVIDER_NAMES[provider];
-  const to = PROVIDER_NAMES[fallback];
+  const from = label(provider);
+  const to = label(fallback);
   if (error?.status === 429) return `⏳ خلص حد ${from} المجاني للردود — بيرد ${to} لين يتجدد.`;
   return `⚠️ ${from} ما رد (\`${shortError(error)}\`) — بيرد ${to} بداله.`;
 }
 
 function replyFrom(provider, system, messages, options = {}) {
-  return provider === 'gemini' ? geminiReply(system, messages, options) : groqReply(system, messages);
+  if (provider === 'gemini') return geminiReply(system, messages, options);
+  if (provider === 'groq') return groqReply(system, messages);
+  return compatReply(provider, system, messages);
 }
 
 // ---------- Gemini ----------
@@ -239,6 +264,44 @@ async function groqReply(system, messages) {
     throw error;
   }
   throw new Error('AI (Groq) request failed');
+}
+
+// ---------- Extra brains (OpenAI chat format: Cerebras, OpenRouter, Mistral, SambaNova, custom) ----------
+const refusedOptions = new Set(); // brains that rejected the "think briefly" option
+
+function compatOptions(name, model) {
+  if (refusedOptions.has(name) || !/gpt-oss/i.test(model)) return {};
+  return name === 'openrouter' ? { reasoning: { effort: 'low' } } : { reasoning_effort: 'low' };
+}
+
+async function compatReply(name, system, messages) {
+  const brain = config.llm.extras[name];
+  const what = `AI (${brain.label})`;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const res = await apiRequest(brain.url, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${brain.apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: brain.model,
+        messages: [{ role: 'system', content: system }, ...messages],
+        max_tokens: brain.maxTokens,
+        ...compatOptions(name, brain.model),
+      }),
+    });
+    if (res.ok) {
+      const text = cleanReply((await res.json())?.choices?.[0]?.message?.content);
+      if (!text) throw new Error(`${what} رجع رد فاضي`); // let the next brain answer instead
+      return text;
+    }
+    const error = await apiError(res, what);
+    if (res.status === 400 && !refusedOptions.has(name) && Object.keys(compatOptions(name, brain.model)).length) {
+      log.warn(`${brain.label} ما يقبل إعدادات التفكير — بكمل بدونها.`);
+      refusedOptions.add(name);
+      continue;
+    }
+    throw error;
+  }
+  throw new Error(`${what} request failed`);
 }
 
 /** The model sometimes copies the "Name: text" format of the question into its answer; drop that. */

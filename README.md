@@ -23,8 +23,15 @@
 | `DISCORD_TOKEN` | https://discord.com/developers/applications ← تطبيقك ← Bot ← Reset Token |
 | `GROQ_API_KEY` | https://console.groq.com/keys ← Create API Key (مجاني، بدون بطاقة) |
 | `GEMINI_API_KEY` | https://aistudio.google.com/apikey ← Create API key (عقلها وصوتها) |
+| `CEREBRAS_API_KEY` | https://cloud.cerebras.ai (عقل احتياط سريع، مجاني) |
+| `OPENROUTER_API_KEY` | https://openrouter.ai/keys (عقل احتياط، موديلات `:free`) |
+| `MISTRAL_API_KEY` | https://console.mistral.ai (عقل احتياط، مجاني، يحتاج تحقق برقم الجوال) |
+| `SAMBANOVA_API_KEY` | https://cloud.sambanova.ai (عقل احتياط) |
+| `CUSTOM_LLM_URL` / `CUSTOM_LLM_API_KEY` / `CUSTOM_LLM_MODEL` | أي خدمة ثانية بصيغة OpenAI |
 
 بدون `GEMINI_API_KEY` البوت يشتغل كله على Groq (أقل جودة، وحدوده أصغر).
+
+**عقول الاحتياط:** كل مفتاح من (Cerebras, OpenRouter, Mistral, SambaNova, Custom) تحطه في Variables يدخل السلسلة لحاله: Gemini ← Groq ← Cerebras ← OpenRouter ← Mistral ← SambaNova ← Custom. إذا العقل الأول وقف أو خلص حده أو تأخر أكثر من `LLM_HEDGE_MS`، اللي بعده يرد وأول جواب يربح، والمتعطل يرتاح فترة. البحث في Google يشتغل بس مع Gemini.
 
 ---
 
@@ -137,7 +144,8 @@
 | `GEMINI_VOICE` | `auto` | `auto` = تصمم صوت إماراتي وتحفظه، أو اسم صوت جاهز مثل `Leda` |
 | `TTS_PROVIDER` / `LLM_PROVIDER` | `gemini` | `groq` = كله على Groq |
 | `TTS_FALLBACK` | `groq` (أو `azure,groq` إذا فيه مفتاح Azure) | أصوات الاحتياط بالترتيب، `none` = بدون احتياط |
-| `LLM_FALLBACK` | `groq` | `none` = بدون احتياط |
+| `LLM_FALLBACK` | `groq` + كل عقل له مفتاح | عقول الاحتياط بالترتيب (مثلاً `cerebras,groq`)، `none` = بدون احتياط |
+| `CEREBRAS_CHAT_MODEL` / `OPENROUTER_CHAT_MODEL` / `MISTRAL_CHAT_MODEL` / `SAMBANOVA_CHAT_MODEL` | `gpt-oss-120b` / `openai/gpt-oss-120b:free` / `mistral-small-latest` / `Meta-Llama-3.3-70B-Instruct` | موديل كل عقل احتياط |
 | `AZURE_SPEECH_KEY` / `AZURE_SPEECH_REGION` | فاضي / `uaenorth` | صوت Azure الإماراتي (فاطمة). عنده حد مجاني شهري، وهو أحسن احتياط لما يخلص حد Gemini وGroq |
 | `GROQ_VOICE_AR` | `noura` | صوت Groq الاحتياطي |
 | `FOLLOWUP_MAX_PEOPLE` | `2` | أكثر من كذا في الروم: ما ترد إلا إذا ناديتها |

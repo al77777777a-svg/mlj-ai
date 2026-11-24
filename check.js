@@ -25,9 +25,10 @@ if (problems.length) {
 }
 const { llm, tts } = config;
 const backup = (fallback) => (fallback ? ` (الاحتياط: ${fallback})` : '');
+const brainModel = (name) => (llm[name] ?? llm.extras[name]).model;
 ok(`الإعدادات كاملة — الاسم: ${config.botName}`);
 note(`السمع: ${config.stt.provider}`);
-note(`العقل: ${llm.provider} / ${llm[llm.provider].model}${backup(llm.fallback)}`);
+note(`العقل: ${llm.provider} / ${brainModel(llm.provider)}${backup(llm.fallbacks.join(' ← '))}`);
 note(`الصوت: ${tts.provider}${tts.provider === 'gemini' ? ` / ${tts.gemini.model} / ${tts.gemini.voice}` : ''}${backup(tts.fallback)}`);
 
 console.log('\n--- تجربة المفاتيح ---');

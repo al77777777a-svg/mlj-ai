@@ -56,14 +56,6 @@ const llmProvider = lower('LLM_PROVIDER', geminiKey ? 'gemini' : 'groq');
 const sttProvider = lower('STT_PROVIDER', 'groq');
 const ttsProvider = lower('TTS_PROVIDER', geminiKey ? 'gemini' : 'groq');
 
-/** The service that steps in when the main one fails ('' = none). */
-function backupFor(name, provider) {
-  const value = lower(name, 'groq');
-  if (['none', 'off', 'false', 'no', 'لا', provider].includes(value)) return '';
-  if (value === 'groq' && !groqKey) return '';
-  return value;
-}
-
 /** Several backups in order ("azure,groq"); with `none` there are none. */
 function backupsFor(name, provider, fallback) {
   const out = [];
@@ -77,6 +69,36 @@ function backupsFor(name, provider, fallback) {
 
 // Voice backups: Azure's Emirati voice first when its key is there, then Groq.
 const ttsBackups = backupsFor('TTS_FALLBACK', ttsProvider, env('AZURE_SPEECH_KEY') ? 'azure,groq' : 'groq');
+
+// More brains that speak the OpenAI chat format. Each one joins the backup chain by itself as soon as its key is set.
+const EXTRA_BRAINS = {
+  cerebras: { label: 'Cerebras', url: 'https://api.cerebras.ai/v1/chat/completions', model: 'gpt-oss-120b' },
+  openrouter: { label: 'OpenRouter', url: 'https://openrouter.ai/api/v1/chat/completions', model: 'openai/gpt-oss-120b:free' },
+  mistral: { label: 'Mistral', url: 'https://api.mistral.ai/v1/chat/completions', model: 'mistral-small-latest' },
+  sambanova: { label: 'SambaNova', url: 'https://api.sambanova.ai/v1/chat/completions', model: 'Meta-Llama-3.3-70B-Instruct' },
+  // Any other OpenAI-compatible service: CUSTOM_LLM_URL (the full .../chat/completions address), CUSTOM_LLM_API_KEY, CUSTOM_LLM_MODEL.
+  custom: { label: 'Custom', url: env('CUSTOM_LLM_URL'), model: env('CUSTOM_LLM_MODEL') },
+};
+const extraBrains = Object.fromEntries(
+  Object.entries(EXTRA_BRAINS).map(([name, brain]) => {
+    const upper = name.toUpperCase();
+    return [
+      name,
+      {
+        label: brain.label,
+        keyName: name === 'custom' ? 'CUSTOM_LLM_API_KEY' : `${upper}_API_KEY`,
+        url: env(`${upper}_CHAT_URL`, brain.url),
+        apiKey: env(name === 'custom' ? 'CUSTOM_LLM_API_KEY' : `${upper}_API_KEY`),
+        model: env(name === 'custom' ? 'CUSTOM_LLM_MODEL' : `${upper}_CHAT_MODEL`, brain.model),
+        maxTokens: num('EXTRA_MAX_TOKENS', 1024),
+      },
+    ];
+  }),
+);
+const extraNames = Object.keys(extraBrains).filter((name) => extraBrains[name].apiKey && extraBrains[name].url && extraBrains[name].model);
+
+// The brain's backups, in order: Groq, then every extra brain that has a key.
+const llmBackups = backupsFor('LLM_FALLBACK', llmProvider, [groqKey && 'groq', ...extraNames].filter(Boolean).join(',') || 'none');
 
 const botName = env('BOT_NAME', 'فطوم');
 
@@ -123,7 +145,10 @@ export const config = {
   // The brain: Gemini or a Groq chat model.
   llm: {
     provider: llmProvider,
-    fallback: backupFor('LLM_FALLBACK', llmProvider),
+    fallbacks: llmBackups, // tried in this order when the main brain fails or is slow
+    fallback: llmBackups[0] ?? '',
+    chain: [llmProvider, ...llmBackups],
+    extras: extraBrains,
     hedgeMs: num('LLM_HEDGE_MS', 1500), // if the main brain is slower than this, the backup starts too and the first answer wins (0 = off)
     // Fresh facts (news, weather, prices...) from Google Search through Gemini: auto = only for questions that need it, always, or off.
     webSearch: lower('WEB_SEARCH', 'auto'),
@@ -225,13 +250,17 @@ export function validateConfig() {
 
   // The brain
   const { llm } = config;
-  for (const [setting, provider] of [
-    ['LLM_PROVIDER', llm.provider],
-    ['LLM_FALLBACK', llm.fallback],
-  ]) {
+  for (const [setting, provider] of [['LLM_PROVIDER', llm.provider], ...llm.fallbacks.map((name) => ['LLM_FALLBACK', name])]) {
     if (provider === 'gemini') need(llm.gemini.apiKey, `GEMINI_API_KEY فاضي — ${GEMINI_HELP}`);
     else if (provider === 'groq') need(llm.groq.apiKey, `GROQ_API_KEY فاضي — ${GROQ_HELP}`);
-    else if (provider) problems.push(`${setting} لازم يكون gemini أو groq.`);
+    else if (llm.extras[provider]) {
+      const brain = llm.extras[provider];
+      need(brain.apiKey, `${brain.keyName} فاضي (مطلوب لأن ${setting}=${provider}).`);
+      need(brain.url, `${provider.toUpperCase()}_CHAT_URL فاضي.`);
+      need(brain.model, `${provider.toUpperCase()}_CHAT_MODEL فاضي.`);
+    } else if (provider) {
+      problems.push(`${setting} لازم يكون gemini أو groq أو ${Object.keys(llm.extras).join(' أو ')}.`);
+    }
   }
 
   // The voice
