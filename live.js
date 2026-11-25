@@ -14,10 +14,18 @@ const apiKey = () => config.tts.gemini.apiKey;
 /** Live answers the voice room now (turned on, a Gemini key, and not resting after a failure). */
 export const liveOn = () => Boolean(config.live.enabled && apiKey() && !isResting('live'));
 
-/** Live failed: the usual way answers for a while (a used-up limit rests longer). */
+/** Live failed: the usual way answers for a while. */
 export function restLive(error) {
-  const status = error?.status ?? (/quota|exhausted|rate/i.test(`${error?.message}`) ? 429 : 503);
-  rest('live', { status, message: error?.message, body: error?.reason ?? '' });
+  const why = `${error?.message ?? ''} ${error?.reason ?? ''}`;
+  // "You exceeded your current quota … plan and billing": this key gets no Live (free tier) — trying again soon only
+  // makes answers slower, so leave it for 12 hours (it starts by itself if Google allows it later, or with billing).
+  if (/quota|billing|exhausted/i.test(why)) {
+    if (rest('live', { status: 429, message: why }, 12 * 60 * 60_000)) {
+      log.warn('Gemini Live ما يشتغل بهالمفتاح المجاني (Google يقول خلص الحد) — بجربه بعد 12 ساعة. بالطريقة العادية لين ذاك.');
+    }
+    return;
+  }
+  rest('live', { status: error?.status ?? 503, message: why });
 }
 
 // ---------- which Live model ----------
@@ -272,7 +280,11 @@ export class LiveVoice {
               fail(error);
             } else if (ws === this.ws) {
               this.ws = null;
-              this.turn?.fail(new Error(`Live: انقطعت الجلسة (${event.code})`));
+              this.turn?.fail(
+                Object.assign(new Error(`Live: انقطعت الجلسة (${event.code}${event.reason ? `: ${event.reason}` : ''})`), {
+                  reason: event.reason,
+                }),
+              );
             }
           });
           ws.addEventListener('error', () => {}); // a close event always follows

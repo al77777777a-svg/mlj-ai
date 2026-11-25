@@ -88,8 +88,8 @@ export function restTime(error) {
  * Let a service rest after an error. Returns true when the room should be told
  * (at most once every 3 hours for the same service and reason).
  */
-export function rest(key, error) {
-  restingUntil.set(key, Date.now() + restTime(error));
+export function rest(key, error, ms = restTime(error)) {
+  restingUntil.set(key, Date.now() + ms);
   const noticeKey = `${key}:${error?.status ?? 'network'}`;
   if (Date.now() - (lastNotice.get(noticeKey) ?? 0) < 3 * 60 * 60_000) return false;
   lastNotice.set(noticeKey, Date.now());
