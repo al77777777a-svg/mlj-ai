@@ -133,10 +133,11 @@ const extraNames = Object.keys(extraBrains).filter((name) => {
 
 // Voice: Gemini Flash-Lite first (fast, and the best Emirati dialect for its speed); if it is slow, Groq joins and the
 // first answer wins; then the other models.
-const VOICE_ORDER = ['gemini', 'groq', 'geminilite', 'groq20b', 'groqqwen', 'mistral', 'geminiflash', 'cerebras', 'openrouter', 'sambanova', 'gemini38', 'custom'];
+// gpt-oss-20b is quick but its Arabic is the weakest (it slipped into other dialects and wrong phrases), so it comes late.
+const VOICE_ORDER = ['gemini', 'groq', 'geminilite', 'groqqwen', 'mistral', 'geminiflash', 'groq20b', 'cerebras', 'openrouter', 'sambanova', 'gemini38', 'custom'];
 // Written chat: other models first, so the voice keeps its limits.
 // (the strongest Arabic first; OpenRouter's random free models last: they wrote nonsense in the chat)
-const TEXT_ORDER = ['geminilite', 'gemini', 'geminiflash', 'groq', 'groq20b', 'groqqwen', 'mistral', 'cerebras', 'sambanova', 'gemini38', 'openrouter', 'custom'];
+const TEXT_ORDER = ['geminilite', 'gemini', 'geminiflash', 'groq', 'groqqwen', 'mistral', 'cerebras', 'sambanova', 'gemini38', 'groq20b', 'openrouter', 'custom'];
 const hasBrain = (name) => (name === 'gemini' ? !!geminiKey : name === 'groq' ? !!groqKey : extraNames.includes(name));
 
 function brainChain(order) {
@@ -231,6 +232,8 @@ export const config = {
     textChain: textBrains, // the written chat's order
     extras: extraBrains,
     hedgeMs: num('LLM_HEDGE_MS', 500), // if the main brain is slower than this, the backup starts too and the first answer wins (0 = off)
+    // The written chat isn't live speech: the better brains get more time before a quicker backup races them.
+    textHedgeMs: num('TEXT_HEDGE_MS', 2500),
     // Fresh facts (news, weather, prices...) from Google Search through Gemini: auto = only for questions that need it, always, or off.
     webSearch: lower('WEB_SEARCH', 'auto'),
     searchWords: list('SEARCH_WORDS', ''), // extra words that make her search
@@ -310,7 +313,9 @@ export const config = {
     },
     azure: {
       apiKey: azureKey,
-      region: env('AZURE_SPEECH_REGION', 'uaenorth'),
+      // The bot runs in US West (Railway), so a US West resource answers quickest. A key from another region is
+      // found by itself at start (see checkAzure in speech.js).
+      region: env('AZURE_SPEECH_REGION', 'westus2'),
       voiceAr: env('AZURE_VOICE_AR', 'ar-AE-FatimaNeural'),
       rate: env('AZURE_RATE', '+10%'), // a bit quicker than the default (sounds awake, not sleepy)
       voiceEn: env('AZURE_VOICE_EN', 'en-US-JennyNeural'),
@@ -375,7 +380,7 @@ export function validateConfig() {
     else if (provider === 'groq') need(t.groq.apiKey, `GROQ_API_KEY فاضي — ${GROQ_HELP}`);
     else if (provider === 'azure') {
       need(t.azure.apiKey, `AZURE_SPEECH_KEY فاضي (مطلوب لأن ${setting}=azure).`);
-      need(t.azure.region, 'AZURE_SPEECH_REGION فاضي (مثلاً uaenorth).');
+      need(t.azure.region, 'AZURE_SPEECH_REGION فاضي (مثلاً westus2).');
     } else if (provider === 'elevenlabs') {
       need(t.elevenlabs.apiKey, `ELEVENLABS_API_KEY فاضي (مطلوب لأن ${setting}=elevenlabs).`);
     } else {

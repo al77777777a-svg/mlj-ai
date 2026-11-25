@@ -532,8 +532,55 @@ export const geminiVoiceChoice = () => geminiVoice();
 
 /** Get her voice ready at start (finds or designs it once), so the first answer doesn't wait for it. */
 export function prepareVoice() {
-  const usesGemini = config.tts.gemini.apiKey && [config.tts.provider, ...config.tts.fallbacks].includes('gemini');
+  const voices = [config.tts.provider, ...config.tts.fallbacks];
+  const usesGemini = config.tts.gemini.apiKey && voices.includes('gemini');
   if (usesGemini && config.tts.gemini.voice.toLowerCase() === 'auto') geminiVoice().catch(() => {});
+  if (config.tts.azure.apiKey && voices.includes('azure')) checkAzure().catch(() => {});
+}
+
+// ---------- Azure: a key works in its own region only ----------
+// If AZURE_SPEECH_REGION doesn't fit the key, the key's region is found by itself (one quick check per region, once).
+const AZURE_REGIONS = [
+  'westus2', 'westus', 'westus3', 'eastus', 'eastus2', 'centralus', 'northcentralus', 'southcentralus', 'westcentralus',
+  'canadacentral', 'canadaeast', 'brazilsouth', 'uaenorth', 'qatarcentral', 'westeurope', 'northeurope', 'uksouth',
+  'ukwest', 'francecentral', 'germanywestcentral', 'switzerlandnorth', 'switzerlandwest', 'swedencentral', 'norwayeast',
+  'italynorth', 'polandcentral', 'spaincentral', 'southafricanorth', 'centralindia', 'southindia', 'jioindiawest',
+  'southeastasia', 'eastasia', 'japaneast', 'japanwest', 'koreacentral', 'australiaeast',
+];
+
+async function azureKeyWorks(region) {
+  try {
+    const res = await apiRequest(
+      `https://${region}.api.cognitive.microsoft.com/sts/v1.0/issueToken`,
+      { method: 'POST', headers: { 'Ocp-Apim-Subscription-Key': config.tts.azure.apiKey }, body: '' },
+      8000,
+      { retry429: false },
+    );
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function checkAzure() {
+  const a = config.tts.azure;
+  const given = a.region;
+  if (await azureKeyWorks(given)) {
+    log.info(`🔊 صوت Azure (${a.voiceAr}) جاهز — المنطقة ${given}.`);
+    return;
+  }
+  const found = await Promise.any(
+    AZURE_REGIONS.filter((region) => region !== given).map(async (region) => {
+      if (await azureKeyWorks(region)) return region;
+      throw new Error(region);
+    }),
+  ).catch(() => '');
+  if (found) {
+    a.region = found;
+    log.info(`🔊 صوت Azure (${a.voiceAr}) جاهز — مفتاحك من منطقة ${found} (مب ${given})، فاستخدمتها بروحي.`);
+  } else {
+    log.warn('مفتاح Azure ما اشتغل في أي منطقة — انسخ KEY 1 كامل من Keys and Endpoint. لين ذاك يرد صوت Gemini/Groq.');
+  }
 }
 
 /** Gemini answers with base64 audio: a WAV file, or raw 16-bit PCM that needs a WAV header. */

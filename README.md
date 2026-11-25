@@ -23,7 +23,7 @@
 | `DISCORD_TOKEN` | https://discord.com/developers/applications ← تطبيقك ← Bot ← Reset Token |
 | `GROQ_API_KEY` | https://console.groq.com/keys ← Create API Key (مجاني، بدون بطاقة) |
 | `GEMINI_API_KEY` | https://aistudio.google.com/apikey ← Create API key (عقلها وصوتها) |
-| `AZURE_SPEECH_KEY` / `AZURE_SPEECH_REGION` | https://portal.azure.com ← Create a resource ← **Speech** ← Pricing tier **Free F0** ← Keys and Endpoint (**ننصح فيه**: أوضح وأسرع صوت إماراتي، وحده المجاني الشهري كبير) |
+| `AZURE_SPEECH_KEY` | https://portal.azure.com ← Create a resource ← **Speech** ← Region **West US 2** ← Pricing tier **Free F0** ← Keys and Endpoint ← KEY 1 (**ننصح فيه**: أوضح وأسرع صوت إماراتي، وحده المجاني الشهري كبير). المنطقة تنعرف بروحها، فيكفي المفتاح |
 | `CEREBRAS_API_KEY` | https://cloud.cerebras.ai (عقل احتياط سريع، مجاني) |
 | `OPENROUTER_API_KEY` | https://openrouter.ai/keys (عقل احتياط، الافتراضي `openrouter/free` يختار موديل مجاني شغال) |
 | `MISTRAL_API_KEY` | https://console.mistral.ai (عقل احتياط، مجاني، يحتاج تحقق برقم الجوال) |
@@ -45,8 +45,10 @@
 | `gemini38` | `gemini-3.8-flash` (20 طلب باليوم بس، فهو آخر واحد) | Gemini |
 | `mistral` / `openrouter` / `cerebras` / `sambanova` / `custom` | موديل كل خدمة | مفتاحها |
 
-- **الصوت** يسأل بالترتيب: gemini ← groq ← geminilite ← groq20b ← groqqwen ← mistral ← geminiflash ← cerebras ← openrouter ← sambanova ← gemini38.
-- **الشات المكتوب** يسأل بترتيب ثاني (geminilite ← geminiflash ← groqqwen ← mistral ← …)، عشان الشات ما يخلص حدود الصوت.
+- **الصوت** يسأل بالترتيب: gemini ← groq ← geminilite ← groqqwen ← mistral ← geminiflash ← groq20b ← cerebras ← openrouter ← sambanova ← gemini38.
+- **الشات المكتوب** يسأل بترتيب ثاني (geminilite ← gemini ← geminiflash ← groq ← groqqwen ← mistral ← … ← groq20b)، عشان الشات ما يخلص حدود الصوت، وينطر العقل الأحسن لين 2.5 ثانية قبل ما يسابقه اللي بعده (`TEXT_HEDGE_MS`).
+- gpt-oss-20b سريع بس عربيته أضعف وحدة (كان يغلط باللهجة وبالعبارات)، فصار من الأواخر.
+- **اللهجة**: إذا عقل احتياط قال «وش» أو «شنو» أو «ايش» تنقلب «شو»، و«شلونك/شلونج» تنقلب «شحالك/شحالج».
 - إذا عقل وقف أو خلص حده أو تأخر أكثر من `LLM_HEDGE_MS`، اللي بعده يرد وأول جواب يربح، والمتعطل يرتاح (لين الوقت اللي تقوله الخدمة). الموديل اللي انحذف يرتاح 12 ساعة.
 - إذا كلهم مرتاحين، تجرب بس الاثنين اللي يصحون أول (مب كلهم، عشان ما تتأخر).
 - البحث في Google (أخبار، طقس…) يروح لـ Gemini أول. `<NAME>_CHAT_MODEL=none` يطفي أي عقل، و`LLM_PROVIDER`/`LLM_FALLBACK` تحط ترتيبك أنت.
@@ -147,7 +149,7 @@
 ## الحدود المجانية (مهم)
 
 - **الصوت هو أصغر حد مجاني**: Gemini عنده 3 موديلات صوت (`gemini-3.8-flash-tts` ← `gemini-3.8-flash-lite-tts` ← `gemini-3.1-flash-tts-preview`) وكل واحد حده اليومي صغير، وصوت Groq حده أصغر.
-- **الحل الأقوى: صوت Azure الإماراتي (فاطمة)**: واضح وسريع، وعنده حد مجاني شهري كبير. حط `AZURE_SPEECH_KEY` و`AZURE_SPEECH_REGION` وتصير هي الصوت الأول تلقائياً، وGemini وGroq احتياط.
+- **الحل الأقوى: صوت Azure الإماراتي (فاطمة)**: واضح وسريع، وعنده حد مجاني شهري كبير (نص مليون حرف بالشهر). حط `AZURE_SPEECH_KEY` بس وتصير هي الصوت الأول تلقائياً، وGemini وGroq احتياط. البوت يعرف منطقة المفتاح بروحه، وفي الـ Logs يطلع «🔊 صوت Azure … جاهز».
 - **السمع**: Whisper في Groq حده 20 طلب بالدقيقة لكل موديل؛ إذا وصل، يكمل `whisper-large-v3`، وبعده Voxtral من Mistral (إذا فيه `MISTRAL_API_KEY`).
 - **العقل**: Groq يحسب حجم الرد من حده بالدقيقة، فرد الصوت صغير (`MAX_REPLY_TOKENS=400`) والشات أكبر (`TEXT_MAX_REPLY_TOKENS=700`).
 - تبي بدون حدود أبد؟ فعّل الدفع في Google AI Studio (رخيص للاستخدام الخفيف).
@@ -194,7 +196,7 @@
 | `STT_FALLBACK_MODELS` | `whisper-large-v3` | موديلات السمع الاحتياط في Groq، `none` = بدون |
 | `STT_MISTRAL` / `MISTRAL_STT_MODEL` | `true` / `voxtral-mini-latest` | آخر احتياط للسمع (يحتاج `MISTRAL_API_KEY`) |
 | `CEREBRAS_CHAT_MODEL` / `OPENROUTER_CHAT_MODEL` / `MISTRAL_CHAT_MODEL` / `SAMBANOVA_CHAT_MODEL` | `gpt-oss-120b` / `openrouter/free` / `mistral-small-latest` / `Meta-Llama-3.3-70B-Instruct` | موديل كل عقل احتياط |
-| `AZURE_SPEECH_KEY` / `AZURE_SPEECH_REGION` | فاضي / `uaenorth` | صوت Azure الإماراتي (فاطمة): أوضح وأسرع صوت، وحده المجاني الشهري كبير. لما تحطه يصير الصوت الأول |
+| `AZURE_SPEECH_KEY` / `AZURE_SPEECH_REGION` | فاضي / `westus2` | صوت Azure الإماراتي (فاطمة): أوضح وأسرع صوت، وحده المجاني الشهري كبير. لما تحطه يصير الصوت الأول. إذا المفتاح من منطقة ثانية، البوت يلقاها بروحه |
 | `GROQ_VOICE_AR` | `noura` | صوت Groq الاحتياطي |
 | `FOLLOWUP_MAX_PEOPLE` | `2` | أكثر من كذا في الروم: ما ترد إلا إذا ناديتها |
 | `FOLLOWUP_BIG_SECONDS` | `10` | في الروم الزحمة: اللي ردت عليه يقدر يسأل سؤال ثاني بدون اسمها خلال هالمدة |

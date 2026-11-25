@@ -140,7 +140,7 @@ const label = (name) => PROVIDER_NAMES[name] ?? config.llm.extras[name]?.label ?
 
 async function createReply(system, messages, onNotice, { search = false, slow = false, medium = 'voice' } = {}) {
   // A search takes longer, and the other brains can't search, so they wait longer before joining in.
-  const hedgeMs = slow ? config.llm.searchHedgeMs : config.llm.hedgeMs;
+  const hedgeMs = slow ? config.llm.searchHedgeMs : medium === 'text' ? config.llm.textHedgeMs : config.llm.hedgeMs;
   const options = { search, medium };
   // The voice and the written chat ask the brains in different orders (so the chat doesn't use up the voice's limits).
   const base = medium === 'text' ? config.llm.textChain : config.llm.chain;
@@ -391,10 +391,25 @@ function stripNamePrefix(text, names) {
 
 /** Drop any "thinking" the model may have written into its answer. */
 function cleanReply(text) {
-  return String(text ?? '')
-    .replace(/<think>[\s\S]*?(?:<\/think>|$)/g, '') // thinking that was cut off (no closing tag) is never spoken
-    .replace(/\s*\[\d+(?:\s*[,،-]\s*\d+)*\]/g, '') // search citation marks like [1] or [2, 3]
-    .trim();
+  return emirati(
+    String(text ?? '')
+      .replace(/<think>[\s\S]*?(?:<\/think>|$)/g, '') // thinking that was cut off (no closing tag) is never spoken
+      .replace(/\s*\[\d+(?:\s*[,،-]\s*\d+)*\]/g, '') // search citation marks like [1] or [2, 3]
+      .trim(),
+  );
+}
+
+// She speaks Emirati. Some backup brains slip into other dialects even when told not to, so those few words
+// become the Emirati ones: وش / شنو / ايش → شو, شلونك → شحالك. Only whole words (letters around them stay).
+const WORD = (words) => new RegExp(`(?<![\\p{L}\\p{M}])(?:${words})(?![\\p{L}\\p{M}])`, 'gu');
+const DIALECT = [
+  [WORD('وش|وشو|شنو|ايش|إيش|أيش'), 'شو'],
+  [WORD('شلونك'), 'شحالك'],
+  [WORD('شلونج'), 'شحالج'],
+  [WORD('شلونكم'), 'شحالكم'],
+];
+export function emirati(text) {
+  return DIALECT.reduce((out, [pattern, word]) => out.replace(pattern, word), text);
 }
 
 /**
